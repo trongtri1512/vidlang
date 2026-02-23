@@ -223,13 +223,28 @@ function secondsToSrtTime(seconds) {
 
 // ── TTS: AI33PRO only ──
 
+// Voice mapping per target language for best quality
+const VOICE_MAP = {
+  vi: "FGY2WhTYpPnrIDTdsKH5",   // Laura - good multilingual support
+  en: "JBFqnCBsd6RMkjVDRZzb",   // George
+  zh: "onwK4e9ZLuTAKqWW03F9",   // Daniel
+  ja: "Xb7hH8MSUJpSbSDYk0k2",   // Alice
+  ko: "EXAVITQu4vr4xnSDxMaL",   // Sarah
+  fr: "TX3LPaxmHKxFdv7VOQHJ",   // Liam
+  es: "cgSgspJ2msm6clMCkdW9",   // Jessica
+  de: "cjVigY5qzO86Huf0OWal",   // Eric
+  th: "SAz9YHcvj6GT2YYXdXww",   // River
+  id: "CwhRBWXzGAHq8TQ4Fs17",   // Roger
+  km: "N2lVS1w4EtoT3dr4eOWO",   // Callum
+};
+
 async function generateTTS(text, outputPath, targetLang) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
   }
 
   console.log("  🔊 Generating TTS with AI33PRO...");
-  const voiceId = ELEVENLABS_VOICE_ID;
+  const voiceId = VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
 
   // Split long text into chunks
   const chunks = splitText(text, 4500);
@@ -361,8 +376,9 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     if (srtPath) {
       // Burn subtitles into video + replace audio
       updateJob(jobId, "merging", 90, "Merging audio & burning subtitles...");
-      const escapedSrt = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
-      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${escapedSrt}':force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+      // Use absolute path and proper escaping for ffmpeg subtitles filter
+      const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     } else {
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     }
