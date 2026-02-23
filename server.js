@@ -12,7 +12,7 @@ app.use(express.json());
 const API_SECRET = process.env.API_SECRET || "change-me";
 const AI33PRO_API_KEY = process.env.AI33PRO_API_KEY || "";
 const AI33PRO_BASE_URL = "https://api.ai33.pro";
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "pFZP5JQG7iQjIQuC4Bku";
 
 const JOBS = {};
 
@@ -29,14 +29,14 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", voiceId, callbackUrl } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl);
+  processVideo(jobId, youtubeUrl, sourceLang, targetLang, voiceId || DEFAULT_VOICE_ID, callbackUrl);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -177,13 +177,13 @@ function parseSrtToText(srt) {
 
 // ── TTS: AI33PRO only ──
 
-async function generateTTS(text, outputPath, targetLang) {
+async function generateTTS(text, outputPath, targetLang, voiceId) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
   }
 
-  console.log("  🔊 Generating TTS with AI33PRO...");
-  const voiceId = ELEVENLABS_VOICE_ID;
+  console.log(`  🔊 Generating TTS with AI33PRO (voice: ${voiceId})...`);
+  const vid = voiceId || DEFAULT_VOICE_ID;
 
   // Split long text into chunks
   const chunks = splitText(text, 4500);
@@ -192,7 +192,7 @@ async function generateTTS(text, outputPath, targetLang) {
   for (let i = 0; i < chunks.length; i++) {
     const chunkPath = outputPath.replace(".mp3", `_chunk${i}.mp3`);
 
-    const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+    const resp = await ai33proRequest(`/v1/text-to-speech/${vid}?output_format=mp3_44100_128`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -261,7 +261,7 @@ async function translateText(text, sourceLang, targetLang) {
 
 // ── Processing pipeline ──
 
-async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl) {
+async function processVideo(jobId, url, sourceLang, targetLang, voiceId, callbackUrl) {
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
@@ -281,7 +281,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl) {
     fs.writeFileSync(`${workDir}/translated.txt`, translatedText);
 
     updateJob(jobId, "generating_voice", 70);
-    await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang);
+    await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang, voiceId);
 
     updateJob(jobId, "merging", 90);
     await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
