@@ -65,7 +65,7 @@ async function ai33proRequest(endpoint, options) {
   return resp;
 }
 
-async function pollAI33ProTask(taskId, maxWaitMs = 3600000, onProgress = null) {
+async function pollAI33ProTask(taskId, maxWaitMs = 7200000, onProgress = null) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const resp = await ai33proRequest(`/v1/task/${taskId}`, { method: "GET", headers: {} });
@@ -131,7 +131,7 @@ async function transcribeAudio(filePath, jobId = null) {
 
   if (jobId) updateJob(jobId, "transcribing", 40, "Waiting for speech recognition...");
 
-  const taskResult = await pollAI33ProTask(result.task_id, 3600000, (elapsed) => {
+  const taskResult = await pollAI33ProTask(result.task_id, 7200000, (elapsed) => {
     if (jobId) {
       const secs = Math.round(elapsed / 1000);
       updateJob(jobId, "transcribing", Math.min(45, 40 + Math.floor(secs / 6)), `Processing speech recognition (${secs}s)...`);
@@ -255,6 +255,15 @@ function getTTSModel(targetLang) {
   return "eleven_multilingual_v2";
 }
 
+// Voice settings for more natural-sounding speech
+const VOICE_SETTINGS = {
+  stability: 0.4,           // Lower = more expressive, natural variation
+  similarity_boost: 0.75,   // Keep voice characteristics
+  style: 0.35,              // Moderate style for natural intonation
+  use_speaker_boost: true,  // Enhanced clarity
+  speed: 1.0,
+};
+
 async function generateTTS(text, outputPath, targetLang) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
@@ -278,7 +287,11 @@ async function generateTTS(text, outputPath, targetLang) {
       body: JSON.stringify({
         text: chunks[i],
         model_id: modelId,
+        voice_settings: VOICE_SETTINGS,
         ...(langCode ? { language_code: langCode } : {}),
+        // Request stitching for multi-chunk
+        ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
+        ...(i < chunks.length - 1 ? { next_text: chunks[i + 1].slice(0, 200) } : {}),
       }),
     });
 
@@ -325,8 +338,8 @@ async function generateTTS(text, outputPath, targetLang) {
   console.log("  ✅ AI33PRO TTS success");
 }
 
-// Generate TTS for a single segment (no chunking)
-async function generateTTSSegment(text, outputPath, voiceId, targetLang) {
+// Generate TTS for a single segment (with optional stitching context)
+async function generateTTSSegment(text, outputPath, voiceId, targetLang, previousText, nextText) {
   const modelId = getTTSModel(targetLang);
   const langCode = LANG_CODE_MAP[targetLang] || null;
   const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
@@ -335,7 +348,11 @@ async function generateTTSSegment(text, outputPath, voiceId, targetLang) {
     body: JSON.stringify({
       text,
       model_id: modelId,
+      voice_settings: VOICE_SETTINGS,
       ...(langCode ? { language_code: langCode } : {}),
+      // Request stitching: provide context from adjacent segments
+      ...(previousText ? { previous_text: previousText } : {}),
+      ...(nextText ? { next_text: nextText } : {}),
     }),
   });
 
@@ -616,8 +633,10 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         updateJob(jobId, "generating_voice", 70 + Math.floor((i / translatedSegments.length) * 15),
           `TTS segment ${i + 1}/${translatedSegments.length}...`);
 
-        // Generate TTS for this single segment
-        await generateTTSSegment(seg.text, segAudioPath, voiceId, targetLang);
+        // Generate TTS for this single segment with stitching context
+        const prevText = i > 0 ? translatedSegments[i - 1].text : null;
+        const nextTextCtx = i < translatedSegments.length - 1 ? translatedSegments[i + 1].text : null;
+        await generateTTSSegment(seg.text, segAudioPath, voiceId, targetLang, prevText, nextTextCtx);
 
         // Measure actual duration of this segment's audio
         const segDuration = await getMediaDuration(segAudioPath);
