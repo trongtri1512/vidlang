@@ -5,15 +5,30 @@ services:
     build: .
     container_name: vidlang-api
     restart: unless-stopped
+    expose:
+      - "3000"
     ports:
       - "3000:3000"
+    volumes:
+      - ./jobs:/app/jobs
+      - ./output:/app/output
     env_file:
       - .env
-    volumes:
-      - ./output:/app/output
-      - ./jobs:/app/jobs
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    environment:
+      - NODE_ENV=production
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vidlang.rule=Host(`youtube.tkey.vn`)"
+      - "traefik.http.routers.vidlang.entrypoints=websecure"
+      - "traefik.http.routers.vidlang.tls.certresolver=letsencrypt"
+      - "traefik.http.services.vidlang.loadbalancer.server.port=3000"
+      - "traefik.http.routers.vidlang-http.rule=Host(`youtube.tkey.vn`)"
+      - "traefik.http.routers.vidlang-http.entrypoints=web"
+      - "traefik.http.routers.vidlang-http.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
