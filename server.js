@@ -305,6 +305,42 @@ async function generateTTS(text, outputPath, targetLang) {
   console.log("  ✅ AI33PRO TTS success");
 }
 
+// Generate TTS for a single segment (no chunking)
+async function generateTTSSegment(text, outputPath, voiceId) {
+  const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text,
+      model_id: "eleven_multilingual_v2",
+    }),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`AI33PRO TTS segment error ${resp.status}: ${errText}`);
+  }
+
+  const result = await resp.json();
+  if (!result.success || !result.task_id) {
+    throw new Error(`AI33PRO TTS segment rejected: ${JSON.stringify(result)}`);
+  }
+  if (result.ec_remain_credits !== undefined && result.ec_remain_credits <= 0) {
+    throw new Error("AI33PRO out of credits");
+  }
+
+  const taskResult = await pollAI33ProTask(result.task_id);
+  if (!taskResult.metadata?.audio_url) {
+    throw new Error("AI33PRO TTS segment: no audio_url in result");
+  }
+
+  const audioResp = await fetch(taskResult.metadata.audio_url);
+  if (!audioResp.ok) throw new Error(`Failed to download segment audio: ${audioResp.status}`);
+
+  const buffer = Buffer.from(await audioResp.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+}
+
 // ── Translation ──
 
 async function translateText(text, sourceLang, targetLang) {
@@ -540,8 +576,57 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     }
     fs.writeFileSync(`${workDir}/translated.txt`, translatedText);
 
-    updateJob(jobId, "generating_voice", 70);
-    await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang);
+    // ── TTS Generation ──
+    if (enableSubtitles && srtPath && transcript.segments && transcript.segments.length > 0) {
+      // === Per-segment TTS: generate audio for each subtitle segment individually ===
+      updateJob(jobId, "generating_voice", 70, "Generating voice per segment...");
+      const translatedSegments = parseSrtToSegments(fs.readFileSync(srtPath, "utf-8"));
+      const voiceId = VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
+      const segAudioFiles = [];
+      let currentTime = 0;
+      let newSrt = "";
+
+      for (let i = 0; i < translatedSegments.length; i++) {
+        const seg = translatedSegments[i];
+        const segAudioPath = `${workDir}/seg_${i}.mp3`;
+
+        updateJob(jobId, "generating_voice", 70 + Math.floor((i / translatedSegments.length) * 15),
+          `TTS segment ${i + 1}/${translatedSegments.length}...`);
+
+        // Generate TTS for this single segment
+        await generateTTSSegment(seg.text, segAudioPath, voiceId);
+
+        // Measure actual duration of this segment's audio
+        const segDuration = await getMediaDuration(segAudioPath);
+        const segStart = currentTime;
+        const segEnd = currentTime + segDuration;
+
+        // Build SRT entry with real timing
+        newSrt += `${i + 1}\n${secondsToSrtTime(segStart)} --> ${secondsToSrtTime(segEnd)}\n${seg.text}\n\n`;
+        segAudioFiles.push(segAudioPath);
+        currentTime = segEnd;
+
+        console.log(`  🎙️ Seg ${i + 1}/${translatedSegments.length}: "${seg.text.substring(0, 30)}..." → ${segDuration.toFixed(2)}s`);
+      }
+
+      // Write re-timed SRT
+      fs.writeFileSync(srtPath, newSrt, "utf-8");
+      console.log(`  ✅ SRT re-timed from actual TTS durations (total: ${currentTime.toFixed(1)}s)`);
+
+      // Concatenate all segment audio files into one
+      updateJob(jobId, "generating_voice", 86, "Concatenating audio segments...");
+      const listFile = `${workDir}/seg_list.txt`;
+      fs.writeFileSync(listFile, segAudioFiles.map((f) => `file '${f}'`).join("\n"));
+      await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${workDir}/tts_audio.mp3"`);
+
+      // Cleanup segment files
+      segAudioFiles.forEach((f) => { try { fs.unlinkSync(f); } catch (_) {} });
+      try { fs.unlinkSync(listFile); } catch (_) {}
+    } else {
+      // No subtitles: single TTS for entire text
+      updateJob(jobId, "generating_voice", 70);
+      await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang);
+    }
 
     updateJob(jobId, "merging", 90);
     if (srtPath) {
@@ -606,6 +691,19 @@ function splitText(text, maxLen) {
 function updateJob(jobId, status, progress, detail = null) {
   JOBS[jobId] = { ...JOBS[jobId], status, progress, detail };
   console.log(`[${jobId}] ${status} (${progress}%)${detail ? ` - ${detail}` : ""}`);
+}
+
+function getMediaDuration(filePath) {
+  return new Promise((resolve) => {
+    exec(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, (err, stdout) => {
+      if (err) {
+        console.error(`  ⚠️ ffprobe error for ${filePath}:`, err.message);
+        resolve(0);
+      } else {
+        resolve(parseFloat(stdout.trim()) || 0);
+      }
+    });
+  });
 }
 
 function run(cmd) {
