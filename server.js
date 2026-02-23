@@ -378,7 +378,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       updateJob(jobId, "merging", 90, "Merging audio & burning subtitles...");
       // Use absolute path and proper escaping for ffmpeg subtitles filter
       const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
-      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+      // HeyGen-style: orange/amber background box, white bold text, centered bottom
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=28,Bold=1,PrimaryColour=&H00FFFFFF,BackColour=&H00009BF0,BorderStyle=4,Outline=0,Shadow=0,MarginV=25,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     } else {
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     }
