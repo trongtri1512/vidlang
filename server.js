@@ -131,7 +131,7 @@ async function transcribeAudio(filePath, jobId = null) {
 
   if (jobId) updateJob(jobId, "transcribing", 40, "Waiting for speech recognition...");
 
-  const taskResult = await pollAI33ProTask(result.task_id, 300000, (elapsed) => {
+  const taskResult = await pollAI33ProTask(result.task_id, 3600000, (elapsed) => {
     if (jobId) {
       const secs = Math.round(elapsed / 1000);
       updateJob(jobId, "transcribing", Math.min(45, 40 + Math.floor(secs / 6)), `Processing speech recognition (${secs}s)...`);
