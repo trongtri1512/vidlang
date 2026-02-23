@@ -5,9 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv ffmpeg curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp
-RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install yt-dlp
-ENV PATH="/opt/venv/bin:$PATH"
+# Install latest yt-dlp (nightly for best YouTube compatibility)
+RUN curl -L https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
 
 # Symlink Node.js so yt-dlp can use it as JS runtime for signature decryption
 RUN ln -sf /usr/local/bin/node /usr/bin/node
