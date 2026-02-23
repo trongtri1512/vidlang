@@ -29,14 +29,14 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", callbackUrl } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, targetLang, callbackUrl);
+  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -65,7 +65,7 @@ async function ai33proRequest(endpoint, options) {
   return resp;
 }
 
-async function pollAI33ProTask(taskId, maxWaitMs = 3600000, onProgress = null) {
+async function pollAI33ProTask(taskId, maxWaitMs = 600000, onProgress = null) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const resp = await ai33proRequest(`/v1/task/${taskId}`, { method: "GET", headers: {} });
@@ -246,9 +246,10 @@ async function generateTTS(text, outputPath, targetLang) {
 
 // ── Translation ──
 
-async function translateText(text, targetLang) {
+async function translateText(text, sourceLang, targetLang) {
   try {
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
+    const sl = sourceLang === "auto" ? "auto" : sourceLang;
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
     const resp = await fetch(url);
     const data = await resp.json();
     return data[0].map((s) => s[0]).join("");
@@ -260,7 +261,7 @@ async function translateText(text, targetLang) {
 
 // ── Processing pipeline ──
 
-async function processVideo(jobId, url, targetLang, callbackUrl) {
+async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl) {
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
@@ -276,7 +277,7 @@ async function processVideo(jobId, url, targetLang, callbackUrl) {
     fs.writeFileSync(`${workDir}/transcript.json`, JSON.stringify(transcript, null, 2));
 
     updateJob(jobId, "translating", 50);
-    const translatedText = await translateText(transcript.text, targetLang);
+    const translatedText = await translateText(transcript.text, sourceLang, targetLang);
     fs.writeFileSync(`${workDir}/translated.txt`, translatedText);
 
     updateJob(jobId, "generating_voice", 70);
