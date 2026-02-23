@@ -29,14 +29,14 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl);
+  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -65,7 +65,7 @@ async function ai33proRequest(endpoint, options) {
   return resp;
 }
 
-async function pollAI33ProTask(taskId, maxWaitMs = 36000000, onProgress = null) {
+async function pollAI33ProTask(taskId, maxWaitMs = 3600000, onProgress = null) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const resp = await ai33proRequest(`/v1/task/${taskId}`, { method: "GET", headers: {} });
@@ -140,12 +140,17 @@ async function transcribeAudio(filePath, jobId = null) {
 
   if (jobId) updateJob(jobId, "transcribing", 48, "Downloading transcript...");
 
+  // Try to get segmented data (with timestamps) for subtitles
   if (taskResult.metadata?.json_url) {
     const jsonResp = await fetch(taskResult.metadata.json_url);
     const jsonData = await jsonResp.json();
     console.log("  ✅ AI33PRO STT success");
     if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
-    return { text: jsonData.text || extractTextFromJson(jsonData), language: jsonData.language || "auto" };
+    return {
+      text: jsonData.text || extractTextFromJson(jsonData),
+      language: jsonData.language || "auto",
+      segments: jsonData.segments || jsonData.chunks || null,
+    };
   }
 
   if (taskResult.metadata?.srt_url) {
@@ -153,7 +158,11 @@ async function transcribeAudio(filePath, jobId = null) {
     const srtText = await srtResp.text();
     console.log("  ✅ AI33PRO STT success (SRT)");
     if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
-    return { text: parseSrtToText(srtText), language: "auto" };
+    return {
+      text: parseSrtToText(srtText),
+      language: "auto",
+      segments: parseSrtToSegments(srtText),
+    };
   }
 
   throw new Error("AI33PRO STT: no transcript in result");
@@ -173,6 +182,43 @@ function parseSrtToText(srt) {
     .filter((line) => line.trim() && !/^\d+$/.test(line.trim()) && !line.includes("-->"))
     .join(" ")
     .trim();
+}
+
+function parseSrtToSegments(srt) {
+  const segments = [];
+  const blocks = srt.trim().split(/\n\n+/);
+  for (const block of blocks) {
+    const lines = block.split("\n").filter((l) => l.trim());
+    if (lines.length < 2) continue;
+    const timeLine = lines.find((l) => l.includes("-->"));
+    if (!timeLine) continue;
+    const [startStr, endStr] = timeLine.split("-->").map((s) => s.trim());
+    const text = lines
+      .filter((l) => !l.includes("-->") && !/^\d+$/.test(l.trim()))
+      .join(" ")
+      .trim();
+    if (text) {
+      segments.push({
+        start: srtTimeToSeconds(startStr),
+        end: srtTimeToSeconds(endStr),
+        text,
+      });
+    }
+  }
+  return segments;
+}
+
+function srtTimeToSeconds(timeStr) {
+  const [h, m, rest] = timeStr.replace(",", ".").split(":");
+  return parseFloat(h) * 3600 + parseFloat(m) * 60 + parseFloat(rest);
+}
+
+function secondsToSrtTime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const ms = Math.round((s - Math.floor(s)) * 1000);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(Math.floor(s)).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
 }
 
 // ── TTS: AI33PRO only ──
@@ -261,7 +307,7 @@ async function translateText(text, sourceLang, targetLang) {
 
 // ── Processing pipeline ──
 
-async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl) {
+async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false) {
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
@@ -277,14 +323,49 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl) {
     fs.writeFileSync(`${workDir}/transcript.json`, JSON.stringify(transcript, null, 2));
 
     updateJob(jobId, "translating", 50);
-    const translatedText = await translateText(transcript.text, sourceLang, targetLang);
+    let translatedText;
+
+    // If subtitles enabled and we have segments, translate per segment
+    let srtPath = null;
+    if (enableSubtitles && transcript.segments && transcript.segments.length > 0) {
+      updateJob(jobId, "translating", 52, "Translating segments for subtitles...");
+      const translatedSegments = [];
+      for (let i = 0; i < transcript.segments.length; i++) {
+        const seg = transcript.segments[i];
+        const translated = await translateText(seg.text, sourceLang, targetLang);
+        translatedSegments.push({ ...seg, text: translated });
+        if (i % 5 === 0) {
+          updateJob(jobId, "translating", 52 + Math.floor((i / transcript.segments.length) * 15), `Translating segment ${i + 1}/${transcript.segments.length}...`);
+        }
+      }
+      translatedText = translatedSegments.map((s) => s.text).join(" ");
+
+      // Generate SRT file
+      srtPath = `${workDir}/subtitles.srt`;
+      let srtContent = "";
+      for (let i = 0; i < translatedSegments.length; i++) {
+        const seg = translatedSegments[i];
+        srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+      }
+      fs.writeFileSync(srtPath, srtContent, "utf-8");
+      console.log(`  📄 Generated SRT with ${translatedSegments.length} segments`);
+    } else {
+      translatedText = await translateText(transcript.text, sourceLang, targetLang);
+    }
     fs.writeFileSync(`${workDir}/translated.txt`, translatedText);
 
     updateJob(jobId, "generating_voice", 70);
     await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang);
 
     updateJob(jobId, "merging", 90);
-    await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+    if (srtPath) {
+      // Burn subtitles into video + replace audio
+      updateJob(jobId, "merging", 90, "Merging audio & burning subtitles...");
+      const escapedSrt = srtPath.replace(/\\/g, "/").replace(/:/g, "\\:");
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${escapedSrt}':force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=2,MarginV=30'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+    } else {
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+    }
 
     const outputFile = `${jobId}.mp4`;
     fs.copyFileSync(`${workDir}/output.mp4`, path.join(__dirname, "output", outputFile));
