@@ -376,6 +376,70 @@ async function translateText(text, sourceLang, targetLang) {
   return text;
 }
 
+// ── YouTube subtitle extraction ──
+
+async function tryYouTubeSubtitles(workDir, url, sourceLang) {
+  try {
+    const langCode = sourceLang === "auto" ? "" : sourceLang;
+
+    // Try to download manual subtitles first, then auto-generated
+    const subArgs = langCode
+      ? `--write-sub --write-auto-sub --sub-lang "${langCode}" --sub-format json3`
+      : `--write-sub --write-auto-sub --sub-format json3`;
+
+    await run(`yt-dlp --skip-download ${subArgs} -o "${workDir}/ytsub" "${url}"`);
+
+    // Find the downloaded subtitle file
+    const files = fs.readdirSync(workDir);
+    const subFile = files.find((f) => f.startsWith("ytsub") && f.endsWith(".json3"));
+
+    if (!subFile) {
+      console.log("  ℹ️ No YouTube subtitles found");
+      return null;
+    }
+
+    console.log(`  📄 Found YouTube subtitle: ${subFile}`);
+    const subData = JSON.parse(fs.readFileSync(path.join(workDir, subFile), "utf-8"));
+
+    // Parse json3 format into segments
+    const segments = [];
+    const events = subData.events || [];
+
+    for (const event of events) {
+      if (!event.segs || event.tStartMs === undefined) continue;
+
+      const text = event.segs.map((s) => s.utf8 || "").join("").trim();
+      if (!text || text === "\n") continue;
+
+      const startSec = event.tStartMs / 1000;
+      const durationMs = event.dDurationMs || 3000;
+      const endSec = (event.tStartMs + durationMs) / 1000;
+
+      segments.push({ start: startSec, end: endSec, text });
+    }
+
+    if (segments.length === 0) {
+      console.log("  ℹ️ YouTube subtitle file empty");
+      return null;
+    }
+
+    const fullText = segments.map((s) => s.text).join(" ");
+    const detectedLang = subFile.match(/\.([a-z]{2}(-[A-Z]{2})?)\./)?.[1] || sourceLang;
+
+    console.log(`  ✅ Extracted ${segments.length} subtitle segments from YouTube (lang: ${detectedLang})`);
+
+    return {
+      text: fullText,
+      language: detectedLang,
+      segments,
+      source: "youtube",
+    };
+  } catch (err) {
+    console.log(`  ℹ️ YouTube subtitle extraction failed: ${err.message}`);
+    return null;
+  }
+}
+
 // ── Processing pipeline ──
 
 async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false) {
@@ -383,14 +447,28 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
   fs.mkdirSync(workDir, { recursive: true });
 
   try {
+    updateJob(jobId, "downloading", 5, "Checking YouTube subtitles...");
+
+    // Step 1: Try to get YouTube subtitles first (fast, free, accurate)
+    const ytSubs = await tryYouTubeSubtitles(workDir, url, sourceLang);
+
     updateJob(jobId, "downloading", 10);
     await run(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${workDir}/video.mp4" "${url}"`);
 
-    updateJob(jobId, "extracting_audio", 20);
-    await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
+    let transcript;
+    if (ytSubs) {
+      // Use YouTube subtitles - skip audio extraction and STT!
+      updateJob(jobId, "transcribing", 30, "Using YouTube subtitles (fast mode)");
+      transcript = ytSubs;
+      console.log(`  ⚡ Skipping STT - using YouTube subtitles (${ytSubs.segments.length} segments)`);
+    } else {
+      // Fallback: extract audio and use STT
+      updateJob(jobId, "extracting_audio", 20);
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
 
-    updateJob(jobId, "transcribing", 30, "Uploading audio to STT service...");
-    const transcript = await transcribeAudio(`${workDir}/audio.wav`, jobId);
+      updateJob(jobId, "transcribing", 30, "Uploading audio to STT service...");
+      transcript = await transcribeAudio(`${workDir}/audio.wav`, jobId);
+    }
     fs.writeFileSync(`${workDir}/transcript.json`, JSON.stringify(transcript, null, 2));
 
     updateJob(jobId, "translating", 50);
