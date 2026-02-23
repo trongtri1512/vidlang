@@ -308,16 +308,72 @@ async function generateTTS(text, outputPath, targetLang) {
 // ── Translation ──
 
 async function translateText(text, sourceLang, targetLang) {
-  try {
-    const sl = sourceLang === "auto" ? "auto" : sourceLang;
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`;
-    const resp = await fetch(url);
-    const data = await resp.json();
-    return data[0].map((s) => s[0]).join("");
-  } catch (err) {
-    console.warn("Translation fallback: returning original text. Error:", err.message);
-    return text;
+  // Split long text into chunks to avoid URL length limits
+  const MAX_CHUNK = 4000;
+  if (text.length > MAX_CHUNK) {
+    const chunks = splitText(text, MAX_CHUNK);
+    const translated = [];
+    for (const chunk of chunks) {
+      translated.push(await translateText(chunk, sourceLang, targetLang));
+    }
+    return translated.join(" ");
   }
+
+  const sl = sourceLang === "auto" ? "auto" : sourceLang;
+
+  // Try multiple Google Translate endpoints
+  const endpoints = [
+    `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`,
+    `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sl}&tl=${targetLang}&q=${encodeURIComponent(text)}`,
+  ];
+
+  for (let i = 0; i < endpoints.length; i++) {
+    for (let retry = 0; retry < 3; retry++) {
+      try {
+        const resp = await fetch(endpoints[i], {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          },
+        });
+
+        const contentType = resp.headers.get("content-type") || "";
+        const bodyText = await resp.text();
+
+        if (!resp.ok || bodyText.trim().startsWith("<!") || bodyText.includes("<html")) {
+          console.warn(`  ⚠️ Translation endpoint ${i} returned HTML/error (status ${resp.status}), retry ${retry + 1}/3`);
+          await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+          continue;
+        }
+
+        const data = JSON.parse(bodyText);
+
+        // Format 1: translate.googleapis.com returns [[["translated","original",...],...]...]
+        if (Array.isArray(data) && Array.isArray(data[0])) {
+          return data[0].map((s) => (Array.isArray(s) ? s[0] : s)).join("");
+        }
+
+        // Format 2: clients5.google.com returns ["translated"] or [["translated"]]
+        if (Array.isArray(data)) {
+          if (typeof data[0] === "string") return data[0];
+          if (Array.isArray(data[0]) && typeof data[0][0] === "string") return data[0][0];
+        }
+
+        // Format 3: object with sentences
+        if (data.sentences) {
+          return data.sentences.map((s) => s.trans).join("");
+        }
+
+        console.warn("  ⚠️ Unexpected translation format:", JSON.stringify(data).substring(0, 200));
+        return text;
+      } catch (err) {
+        console.warn(`  ⚠️ Translation error (endpoint ${i}, retry ${retry + 1}/3):`, err.message);
+        await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+      }
+    }
+  }
+
+  console.error("  ❌ All translation attempts failed, returning original text");
+  return text;
 }
 
 // ── Processing pipeline ──
