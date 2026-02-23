@@ -238,12 +238,31 @@ const VOICE_MAP = {
   km: "N2lVS1w4EtoT3dr4eOWO",   // Callum
 };
 
+// Languages that require Flash v2.5 (not supported by multilingual v2)
+const FLASH_ONLY_LANGS = ["vi", "hu", "no"];
+
+// ElevenLabs language codes for explicit language hints
+const LANG_CODE_MAP = {
+  vi: "vi", en: "en", zh: "zh", ja: "ja", ko: "ko",
+  fr: "fr", es: "es", de: "de", th: "th", id: "id",
+  km: "km", hu: "hu", no: "no",
+};
+
+function getTTSModel(targetLang) {
+  if (FLASH_ONLY_LANGS.includes(targetLang)) {
+    return "eleven_flash_v2_5";
+  }
+  return "eleven_multilingual_v2";
+}
+
 async function generateTTS(text, outputPath, targetLang) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
   }
 
-  console.log("  🔊 Generating TTS with AI33PRO...");
+  const modelId = getTTSModel(targetLang);
+  const langCode = LANG_CODE_MAP[targetLang] || null;
+  console.log(`  🔊 Generating TTS with AI33PRO (model: ${modelId}, lang: ${langCode || 'auto'})...`);
   const voiceId = VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
 
   // Split long text into chunks
@@ -258,7 +277,8 @@ async function generateTTS(text, outputPath, targetLang) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text: chunks[i],
-        model_id: "eleven_multilingual_v2",
+        model_id: modelId,
+        ...(langCode ? { language_code: langCode } : {}),
       }),
     });
 
@@ -306,13 +326,16 @@ async function generateTTS(text, outputPath, targetLang) {
 }
 
 // Generate TTS for a single segment (no chunking)
-async function generateTTSSegment(text, outputPath, voiceId) {
+async function generateTTSSegment(text, outputPath, voiceId, targetLang) {
+  const modelId = getTTSModel(targetLang);
+  const langCode = LANG_CODE_MAP[targetLang] || null;
   const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       text,
-      model_id: "eleven_multilingual_v2",
+      model_id: modelId,
+      ...(langCode ? { language_code: langCode } : {}),
     }),
   });
 
@@ -594,7 +617,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
           `TTS segment ${i + 1}/${translatedSegments.length}...`);
 
         // Generate TTS for this single segment
-        await generateTTSSegment(seg.text, segAudioPath, voiceId);
+        await generateTTSSegment(seg.text, segAudioPath, voiceId, targetLang);
 
         // Measure actual duration of this segment's audio
         const segDuration = await getMediaDuration(segAudioPath);
