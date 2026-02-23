@@ -65,7 +65,7 @@ async function ai33proRequest(endpoint, options) {
   return resp;
 }
 
-async function pollAI33ProTask(taskId, maxWaitMs = 600000, onProgress = null) {
+async function pollAI33ProTask(taskId, maxWaitMs = 36000000, onProgress = null) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     const resp = await ai33proRequest(`/v1/task/${taskId}`, { method: "GET", headers: {} });
