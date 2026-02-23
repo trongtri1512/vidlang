@@ -392,7 +392,7 @@ async function tryYouTubeSubtitles(workDir, url, sourceLang) {
     // First try: manual subtitles for source language
     if (subLangArg) {
       try {
-        await run(`yt-dlp --skip-download --write-sub ${subLangArg} --sub-format json3 -o "${workDir}/ytsub" "${url}"`);
+        await run(`yt-dlp --skip-download --write-sub ${subLangArg} --sub-format srt -o "${workDir}/ytsub" "${url}"`);
         const result = parseYouTubeSubFile(workDir, sourceLang);
         if (result) {
           console.log(`  ✅ Using manual YouTube subtitle (${result.language})`);
@@ -404,7 +404,7 @@ async function tryYouTubeSubtitles(workDir, url, sourceLang) {
     // Second try: auto-generated subtitles for source language
     if (subLangArg) {
       try {
-        await run(`yt-dlp --skip-download --write-auto-sub ${subLangArg} --sub-format json3 -o "${workDir}/ytsub" "${url}"`);
+        await run(`yt-dlp --skip-download --write-auto-sub ${subLangArg} --sub-format srt -o "${workDir}/ytsub" "${url}"`);
         const result = parseYouTubeSubFile(workDir, sourceLang);
         if (result) {
           console.log(`  ✅ Using auto-generated YouTube subtitle (${result.language})`);
@@ -415,7 +415,7 @@ async function tryYouTubeSubtitles(workDir, url, sourceLang) {
 
     // Third try: any available subtitle
     try {
-      await run(`yt-dlp --skip-download --write-sub --write-auto-sub --sub-format json3 -o "${workDir}/ytsub" "${url}"`);
+      await run(`yt-dlp --skip-download --write-sub --write-auto-sub --sub-format srt -o "${workDir}/ytsub" "${url}"`);
       const result = parseYouTubeSubFile(workDir, sourceLang);
       if (result) {
         console.log(`  ✅ Using available YouTube subtitle (${result.language})`);
@@ -433,33 +433,38 @@ async function tryYouTubeSubtitles(workDir, url, sourceLang) {
 
 function parseYouTubeSubFile(workDir, sourceLang) {
   const files = fs.readdirSync(workDir);
-  const subFile = files.find((f) => f.startsWith("ytsub") && f.endsWith(".json3"));
+  const subFile = files.find((f) => f.startsWith("ytsub") && (f.endsWith(".srt") || f.endsWith(".json3")));
 
   if (!subFile) return null;
 
   console.log(`  📄 Found YouTube subtitle: ${subFile}`);
-  const subData = JSON.parse(fs.readFileSync(path.join(workDir, subFile), "utf-8"));
+  const filePath = path.join(workDir, subFile);
+  const content = fs.readFileSync(filePath, "utf-8");
 
-  const segments = [];
-  const events = subData.events || [];
-
-  for (const event of events) {
-    if (!event.segs || event.tStartMs === undefined) continue;
-
-    const text = event.segs.map((s) => s.utf8 || "").join("").trim();
-    if (!text || text === "\n") continue;
-
-    const startSec = event.tStartMs / 1000;
-    const durationMs = event.dDurationMs || 3000;
-    const endSec = (event.tStartMs + durationMs) / 1000;
-
-    segments.push({ start: startSec, end: endSec, text });
+  let segments;
+  if (subFile.endsWith(".json3")) {
+    // Legacy json3 parsing
+    const subData = JSON.parse(content);
+    segments = [];
+    const events = subData.events || [];
+    for (const event of events) {
+      if (!event.segs || event.tStartMs === undefined) continue;
+      const text = event.segs.map((s) => s.utf8 || "").join("").trim();
+      if (!text || text === "\n") continue;
+      const startSec = event.tStartMs / 1000;
+      const durationMs = event.dDurationMs || 3000;
+      const endSec = (event.tStartMs + durationMs) / 1000;
+      segments.push({ start: startSec, end: endSec, text });
+    }
+  } else {
+    // SRT parsing
+    segments = parseSrtToSegments(content);
   }
 
-  if (segments.length === 0) return null;
+  if (!segments || segments.length === 0) return null;
 
   // Clean up the file to avoid re-detection
-  fs.unlinkSync(path.join(workDir, subFile));
+  fs.unlinkSync(filePath);
 
   const fullText = segments.map((s) => s.text).join(" ");
   const detectedLang = subFile.match(/\.([a-z]{2}(-[A-Z]{2})?)\./)?.[1] || sourceLang;
