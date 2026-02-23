@@ -267,7 +267,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, voiceId, callbac
 
   try {
     updateJob(jobId, "downloading", 10);
-    await run(`yt-dlp -f "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b" --merge-output-format mp4 -o "${workDir}/video.mp4" "${url}"`);
+    await run(`yt-dlp --extractor-args "youtube:player_client=web" -f "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best" --merge-output-format mp4 --retries 5 --fragment-retries 5 --socket-timeout 30 --concurrent-fragments 4 -o "${workDir}/video.mp4" "${url}"`);
 
     updateJob(jobId, "extracting_audio", 20);
     await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
