@@ -363,7 +363,7 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
   for (let batchStart = 0; batchStart < chunks.length; batchStart += TTS_CONCURRENCY) {
     const batchEnd = Math.min(batchStart + TTS_CONCURRENCY, chunks.length);
     const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
-    const results = await Promise.all(batchIndices.map(processChunk));
+    const results = await Promise.all(batchIndices.map(i => processChunk(i)));
     chunkFiles.push(...results);
   }
 
@@ -712,7 +712,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / translatedSegments.length) * 15),
           `TTS segments ${batchStart + 1}-${batchEnd}/${translatedSegments.length}...`);
         const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
-        const results = await Promise.allSettled(batchIndices.map(processSegTTS));
+        const results = await Promise.allSettled(batchIndices.map(i => processSegTTS(i)));
         for (let k = 0; k < results.length; k++) {
           if (results[k].status === "rejected") {
             const segIdx = batchIndices[k];
