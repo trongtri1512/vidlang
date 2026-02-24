@@ -4,10 +4,19 @@ const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { v4: uuidv4 } = require("uuid");
+const multer = require("multer");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Multer config for video uploads (max 2GB)
+const uploadDir = path.join(__dirname, "uploads");
+fs.mkdirSync(uploadDir, { recursive: true });
+const upload = multer({
+  dest: uploadDir,
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB
+});
 
 const API_SECRET = process.env.API_SECRET || "change-me";
 const AI33PRO_API_KEY = process.env.AI33PRO_API_KEY || "";
@@ -51,6 +60,21 @@ app.get("/api/jobs", auth, (_req, res) => {
 });
 
 app.use("/output", express.static(path.join(__dirname, "output")));
+app.use("/uploads", express.static(uploadDir));
+
+// Upload video file endpoint
+app.post("/api/upload", auth, upload.single("video"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No video file provided" });
+  
+  const ext = path.extname(req.file.originalname) || ".mp4";
+  const newName = `${req.file.filename}${ext}`;
+  const newPath = path.join(uploadDir, newName);
+  fs.renameSync(req.file.path, newPath);
+  
+  const fileUrl = `/uploads/${newName}`;
+  console.log(`📁 File uploaded: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(1)}MB) → ${fileUrl}`);
+  res.json({ url: fileUrl, filename: req.file.originalname, size: req.file.size });
+});
 
 // ── AI33PRO helpers ──
 
@@ -559,23 +583,34 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
+  const isYouTube = /(?:youtube\.com|youtu\.be)/i.test(url);
+
   try {
-    updateJob(jobId, "downloading", 5, "Checking YouTube subtitles...");
+    if (isYouTube) {
+      updateJob(jobId, "downloading", 5, "Checking YouTube subtitles...");
 
-    // Step 1: Try to get YouTube subtitles first (fast, free, accurate)
-    const ytSubs = await tryYouTubeSubtitles(workDir, url, sourceLang);
+      // Step 1: Try to get YouTube subtitles first (fast, free, accurate)
+      const ytSubs = await tryYouTubeSubtitles(workDir, url, sourceLang);
 
-    updateJob(jobId, "downloading", 10);
-    await run(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${workDir}/video.mp4" "${url}"`);
+      updateJob(jobId, "downloading", 10, "Downloading YouTube video...");
+      await run(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${workDir}/video.mp4" "${url}"`);
 
-    let transcript;
-    if (ytSubs) {
-      // Use YouTube subtitles - skip audio extraction and STT!
-      updateJob(jobId, "transcribing", 30, "Using YouTube subtitles (fast mode)");
-      transcript = ytSubs;
-      console.log(`  ⚡ Skipping STT - using YouTube subtitles (${ytSubs.segments.length} segments)`);
+      var transcript;
+      if (ytSubs) {
+        updateJob(jobId, "transcribing", 30, "Using YouTube subtitles (fast mode)");
+        transcript = ytSubs;
+        console.log(`  ⚡ Skipping STT - using YouTube subtitles (${ytSubs.segments.length} segments)`);
+      }
     } else {
-      // Fallback: extract audio and use STT
+      // Direct video URL: download with curl
+      updateJob(jobId, "downloading", 5, "Downloading video from URL...");
+      await run(`curl -L -o "${workDir}/video.mp4" --max-filesize 2147483648 --connect-timeout 30 --max-time 3600 "${url}"`);
+      updateJob(jobId, "downloading", 15, "Video downloaded");
+      var transcript;
+    }
+
+    if (!transcript) {
+      // Fallback: extract audio and use STT (for direct URLs or YouTube without subs)
       updateJob(jobId, "extracting_audio", 20);
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
 
