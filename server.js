@@ -22,6 +22,7 @@ const API_SECRET = process.env.API_SECRET || "change-me";
 const AI33PRO_API_KEY = process.env.AI33PRO_API_KEY || "";
 const AI33PRO_BASE_URL = "https://api.ai33.pro";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
+const GOOGLE_TRANSLATE_API_KEY = process.env.GOOGLE_TRANSLATE_API_KEY || "";
 
 const JOBS = {};
 
@@ -408,7 +409,7 @@ async function generateTTSSegment(text, outputPath, voiceId, targetLang, previou
 // ── Translation ──
 
 async function translateText(text, sourceLang, targetLang) {
-  // Split long text into chunks to avoid URL length limits
+  // Split long text into chunks
   const MAX_CHUNK = 4000;
   if (text.length > MAX_CHUNK) {
     const chunks = splitText(text, MAX_CHUNK);
@@ -419,9 +420,55 @@ async function translateText(text, sourceLang, targetLang) {
     return translated.join(" ");
   }
 
-  const sl = sourceLang === "auto" ? "auto" : sourceLang;
+  // Use official Google Cloud Translation API if key is available
+  if (GOOGLE_TRANSLATE_API_KEY) {
+    for (let retry = 0; retry < 3; retry++) {
+      try {
+        const body = {
+          q: text,
+          target: targetLang,
+          format: "text",
+        };
+        if (sourceLang && sourceLang !== "auto") {
+          body.source = sourceLang;
+        }
 
-  // Try multiple Google Translate endpoints
+        const resp = await fetch(
+          `https://translation.googleapis.com/language/translate/v2?key=${GOOGLE_TRANSLATE_API_KEY}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }
+        );
+
+        if (!resp.ok) {
+          const errText = await resp.text();
+          console.warn(`  ⚠️ Google Translate API error (status ${resp.status}, retry ${retry + 1}/3): ${errText.substring(0, 200)}`);
+          await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+          continue;
+        }
+
+        const data = await resp.json();
+        const translated = data.data?.translations?.[0]?.translatedText;
+        if (translated) {
+          console.log(`  ✅ Google Cloud Translation API success (${sourceLang} → ${targetLang})`);
+          return translated;
+        }
+
+        console.warn("  ⚠️ Unexpected Google Translate API response:", JSON.stringify(data).substring(0, 200));
+        return text;
+      } catch (err) {
+        console.warn(`  ⚠️ Google Translate API error (retry ${retry + 1}/3):`, err.message);
+        await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+      }
+    }
+    console.error("  ❌ Google Cloud Translation API failed after 3 retries, returning original text");
+    return text;
+  }
+
+  // Fallback: free Google Translate endpoints
+  const sl = sourceLang === "auto" ? "auto" : sourceLang;
   const endpoints = [
     `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=${targetLang}&dt=t&q=${encodeURIComponent(text)}`,
     `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=${sl}&tl=${targetLang}&q=${encodeURIComponent(text)}`,
@@ -431,38 +478,26 @@ async function translateText(text, sourceLang, targetLang) {
     for (let retry = 0; retry < 3; retry++) {
       try {
         const resp = await fetch(endpoints[i], {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          },
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
         });
-
         const contentType = resp.headers.get("content-type") || "";
         const bodyText = await resp.text();
-
         if (!resp.ok || bodyText.trim().startsWith("<!") || bodyText.includes("<html")) {
           console.warn(`  ⚠️ Translation endpoint ${i} returned HTML/error (status ${resp.status}), retry ${retry + 1}/3`);
           await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
           continue;
         }
-
         const data = JSON.parse(bodyText);
-
-        // Format 1: translate.googleapis.com returns [[["translated","original",...],...]...]
         if (Array.isArray(data) && Array.isArray(data[0])) {
           return data[0].map((s) => (Array.isArray(s) ? s[0] : s)).join("");
         }
-
-        // Format 2: clients5.google.com returns ["translated"] or [["translated"]]
         if (Array.isArray(data)) {
           if (typeof data[0] === "string") return data[0];
           if (Array.isArray(data[0]) && typeof data[0][0] === "string") return data[0][0];
         }
-
-        // Format 3: object with sentences
         if (data.sentences) {
           return data.sentences.map((s) => s.trans).join("");
         }
-
         console.warn("  ⚠️ Unexpected translation format:", JSON.stringify(data).substring(0, 200));
         return text;
       } catch (err) {
