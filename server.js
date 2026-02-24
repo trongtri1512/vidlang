@@ -295,6 +295,12 @@ const VOICE_SETTINGS = {
   speed: 1.0,
 };
 
+// Voice settings for eleven_v3 (simpler params to avoid invalid_ttd_stability)
+const VOICE_SETTINGS_V3 = {
+  stability: 0.5,
+  similarity_boost: 0.75,
+};
+
 async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
@@ -318,7 +324,7 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
       body: JSON.stringify({
         text: chunks[i],
         model_id: modelId,
-        voice_settings: VOICE_SETTINGS,
+        voice_settings: modelId === "eleven_v3" ? VOICE_SETTINGS_V3 : VOICE_SETTINGS,
         ...(langCode ? { language_code: langCode } : {}),
         // Request stitching for multi-chunk
         ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
@@ -341,7 +347,39 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
       throw new Error("AI33PRO out of credits");
     }
 
-    const taskResult = await pollAI33ProTask(result.task_id);
+    let taskResult;
+    try {
+      taskResult = await pollAI33ProTask(result.task_id);
+    } catch (taskErr) {
+      // Fallback: if eleven_v3 fails (e.g. invalid_ttd_stability), retry with eleven_flash_v2_5
+      if (modelId === "eleven_v3" && String(taskErr).includes("invalid_ttd_stability")) {
+        const fallbackModel = "eleven_flash_v2_5";
+        console.log(`  ⚠️ eleven_v3 failed, retrying chunk ${i} with ${fallbackModel}...`);
+        const retryResp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: chunks[i],
+            model_id: fallbackModel,
+            voice_settings: VOICE_SETTINGS,
+            ...(langCode ? { language_code: langCode } : {}),
+            ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
+            ...(i < chunks.length - 1 ? { next_text: chunks[i + 1].slice(0, 200) } : {}),
+          }),
+        });
+        if (!retryResp.ok) {
+          const errText = await retryResp.text();
+          throw new Error(`AI33PRO TTS fallback error ${retryResp.status}: ${errText}`);
+        }
+        const retryResult = await retryResp.json();
+        if (!retryResult.success || !retryResult.task_id) {
+          throw new Error(`AI33PRO TTS fallback rejected: ${JSON.stringify(retryResult)}`);
+        }
+        taskResult = await pollAI33ProTask(retryResult.task_id);
+      } else {
+        throw taskErr;
+      }
+    }
 
     if (!taskResult.metadata?.audio_url) {
       throw new Error("AI33PRO TTS: no audio_url in result");
