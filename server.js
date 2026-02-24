@@ -230,7 +230,7 @@ function generateSegmentsFromText(text) {
   return segments;
 }
 
-
+function parseSrtToText(srt) {
   return srt
     .split("\n")
     .filter((line) => line.trim() && !/^\d+$/.test(line.trim()) && !line.includes("-->"))
