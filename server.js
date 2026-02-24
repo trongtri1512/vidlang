@@ -23,6 +23,7 @@ const AI33PRO_API_KEY = process.env.AI33PRO_API_KEY || "";
 const AI33PRO_BASE_URL = "https://api.ai33.pro";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 const GOOGLE_TRANSLATE_API_KEY = process.env.GOOGLE_TRANSLATE_API_KEY || "";
+const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || GOOGLE_TRANSLATE_API_KEY; // Can reuse same Google Cloud API key
 
 const JOBS = {};
 
@@ -246,88 +247,96 @@ function secondsToSrtTime(seconds) {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(Math.floor(s)).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
 }
 
-// ── TTS: AI33PRO only ──
+// ── TTS: Google Cloud Text-to-Speech (Standard voices) ──
 
-// Voice mapping per target language for best quality
-const VOICE_MAP = {
-  vi: "FGY2WhTYpPnrIDTdsKH5",   // Laura - good multilingual support
-  en: "JBFqnCBsd6RMkjVDRZzb",   // George
-  zh: "onwK4e9ZLuTAKqWW03F9",   // Daniel
-  ja: "Xb7hH8MSUJpSbSDYk0k2",   // Alice
-  ko: "EXAVITQu4vr4xnSDxMaL",   // Sarah
-  fr: "TX3LPaxmHKxFdv7VOQHJ",   // Liam
-  es: "cgSgspJ2msm6clMCkdW9",   // Jessica
-  de: "cjVigY5qzO86Huf0OWal",   // Eric
-  th: "SAz9YHcvj6GT2YYXdXww",   // River
-  id: "CwhRBWXzGAHq8TQ4Fs17",   // Roger
-  km: "N2lVS1w4EtoT3dr4eOWO",   // Callum
+// Google TTS Standard voice mapping per language
+const GOOGLE_VOICE_MAP = {
+  vi: { languageCode: "vi-VN", name: "vi-VN-Standard-A", ssmlGender: "FEMALE" },
+  en: { languageCode: "en-US", name: "en-US-Standard-C", ssmlGender: "FEMALE" },
+  zh: { languageCode: "cmn-CN", name: "cmn-CN-Standard-A", ssmlGender: "FEMALE" },
+  ja: { languageCode: "ja-JP", name: "ja-JP-Standard-A", ssmlGender: "FEMALE" },
+  ko: { languageCode: "ko-KR", name: "ko-KR-Standard-A", ssmlGender: "FEMALE" },
+  fr: { languageCode: "fr-FR", name: "fr-FR-Standard-A", ssmlGender: "FEMALE" },
+  es: { languageCode: "es-ES", name: "es-ES-Standard-A", ssmlGender: "FEMALE" },
+  de: { languageCode: "de-DE", name: "de-DE-Standard-A", ssmlGender: "FEMALE" },
+  th: { languageCode: "th-TH", name: "th-TH-Standard-A", ssmlGender: "FEMALE" },
+  id: { languageCode: "id-ID", name: "id-ID-Standard-A", ssmlGender: "FEMALE" },
 };
 
-// Languages that require Flash v2.5 (not supported by multilingual v2)
-const FLASH_ONLY_LANGS = ["hu", "no"];
+// Google TTS has a 5000 byte limit per request
+const GOOGLE_TTS_MAX_BYTES = 4800;
 
-// Languages that use ElevenLabs v3 model
-const V3_LANGS = ["vi"];
-
-// ElevenLabs language codes for explicit language hints
-const LANG_CODE_MAP = {
-  vi: "vi", en: "en", zh: "zh", ja: "ja", ko: "ko",
-  fr: "fr", es: "es", de: "de", th: "th", id: "id",
-  km: "km", hu: "hu", no: "no",
-};
-
-function getTTSModel(targetLang) {
-  if (V3_LANGS.includes(targetLang)) {
-    return "eleven_v3";
+async function googleTTSSynthesize(text, targetLang, customVoiceName = null) {
+  if (!GOOGLE_TTS_API_KEY) {
+    throw new Error("GOOGLE_TTS_API_KEY is not configured (set GOOGLE_TTS_API_KEY or GOOGLE_TRANSLATE_API_KEY)");
   }
-  if (FLASH_ONLY_LANGS.includes(targetLang)) {
-    return "eleven_flash_v2_5";
+
+  const defaultVoice = GOOGLE_VOICE_MAP[targetLang] || GOOGLE_VOICE_MAP["en"];
+  
+  // If customVoiceName looks like a Google voice name (e.g. "vi-VN-Standard-A"), use it
+  let voiceName = defaultVoice.name;
+  let languageCode = defaultVoice.languageCode;
+  if (customVoiceName && customVoiceName.includes("-Standard-")) {
+    voiceName = customVoiceName;
+    // Extract language code from voice name (e.g. "vi-VN-Standard-A" → "vi-VN")
+    const parts = customVoiceName.split("-Standard-");
+    if (parts[0]) languageCode = parts[0];
   }
-  return "eleven_multilingual_v2";
+
+  const resp = await fetch(
+    `https://texttospeech.googleapis.com/v1/text:synthesize?key=${GOOGLE_TTS_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        input: { text },
+        voice: {
+          languageCode,
+          name: voiceName,
+        },
+        audioConfig: {
+          audioEncoding: "MP3",
+          sampleRateHertz: 24000,
+          speakingRate: 1.0,
+          pitch: 0,
+        },
+      }),
+    }
+  );
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Google TTS error ${resp.status}: ${errText}`);
+  }
+
+  const data = await resp.json();
+  if (!data.audioContent) {
+    throw new Error("Google TTS: no audioContent in response");
+  }
+
+  return Buffer.from(data.audioContent, "base64");
 }
 
-// Voice settings for more natural-sounding speech
-const VOICE_SETTINGS = {
-  stability: 0.4,           // Lower = more expressive, natural variation
-  similarity_boost: 0.75,   // Keep voice characteristics
-  style: 0.35,              // Moderate style for natural intonation
-  use_speaker_boost: true,  // Enhanced clarity
-  speed: 1.0,
-};
-
-// Voice settings for eleven_v3 (simpler params to avoid invalid_ttd_stability)
-const VOICE_SETTINGS_V3 = {
-  stability: 0.5,
-  similarity_boost: 0.75,
-};
-
 async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
-  if (!AI33PRO_API_KEY) {
-    throw new Error("AI33PRO_API_KEY is not configured");
-  }
+  console.log(`  🔊 Generating TTS with Google Cloud TTS (lang: ${targetLang}, voice: ${GOOGLE_VOICE_MAP[targetLang]?.name || 'en-US-Standard-C'})...`);
 
-  const modelId = getTTSModel(targetLang);
-  const langCode = LANG_CODE_MAP[targetLang] || null;
-  console.log(`  🔊 Generating TTS with AI33PRO (model: ${modelId}, lang: ${langCode || 'auto'})...`);
-  const voiceId = customVoiceId || VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
-
-  // Split long text into chunks
-  const chunks = splitText(text, 4500);
+  // Split long text into chunks respecting Google's byte limit
+  const chunks = splitText(text, GOOGLE_TTS_MAX_BYTES);
   const chunkFiles = [];
 
-  const TTS_CONCURRENCY = 5; // Reduced to avoid 429 rate limits
+  const TTS_CONCURRENCY = 20; // Google TTS allows ~1000 req/min for Standard
 
-  // Helper: process a single chunk with retry + exponential backoff + jitter
   const processChunk = async (i, retries = 5) => {
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
-        return await _processChunkOnce(i);
+        const chunkPath = outputPath.replace(".mp3", `_chunk${i}.mp3`);
+        const audioBuffer = await googleTTSSynthesize(chunks[i], targetLang, customVoiceId);
+        fs.writeFileSync(chunkPath, audioBuffer);
+        return chunkPath;
       } catch (err) {
-        const msg = String(err);
-        const isRetryable = msg.includes("429") || msg.includes("rate") || msg.includes("too many") || msg.includes("503") || msg.includes("timeout");
-        if (isRetryable && attempt < retries) {
-          const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
-          console.log(`  🔄 Chunk ${i} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${msg.slice(0, 100)}`);
+        if (attempt < retries) {
+          const delay = Math.pow(2, attempt) * 500 + Math.random() * 500;
+          console.log(`  🔄 Chunk ${i} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${String(err).slice(0, 120)}`);
           await new Promise(r => setTimeout(r, delay));
         } else {
           throw err;
@@ -336,70 +345,6 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
     }
   };
 
-  const _processChunkOnce = async (i) => {
-    const chunkPath = outputPath.replace(".mp3", `_chunk${i}.mp3`);
-
-    const bodyPayload = {
-      text: chunks[i],
-      model_id: modelId,
-      voice_settings: modelId === "eleven_v3" ? VOICE_SETTINGS_V3 : VOICE_SETTINGS,
-      ...(langCode ? { language_code: langCode } : {}),
-      ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
-      ...(i < chunks.length - 1 ? { next_text: chunks[i + 1].slice(0, 200) } : {}),
-    };
-
-    const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(bodyPayload),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`AI33PRO TTS error ${resp.status}: ${errText}`);
-    }
-
-    const result = await resp.json();
-    if (!result.success || !result.task_id) {
-      throw new Error(`AI33PRO TTS rejected: ${JSON.stringify(result)}`);
-    }
-    if (result.ec_remain_credits !== undefined && result.ec_remain_credits <= 0) {
-      throw new Error("AI33PRO out of credits");
-    }
-
-    let taskResult;
-    try {
-      taskResult = await pollAI33ProTask(result.task_id);
-    } catch (taskErr) {
-      if (modelId === "eleven_v3" && String(taskErr).includes("invalid_ttd_stability")) {
-        const fallbackModel = "eleven_flash_v2_5";
-        console.log(`  ⚠️ eleven_v3 failed, retrying chunk ${i} with ${fallbackModel}...`);
-        const retryResp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...bodyPayload, model_id: fallbackModel, voice_settings: VOICE_SETTINGS }),
-        });
-        if (!retryResp.ok) throw new Error(`AI33PRO TTS fallback error ${retryResp.status}: ${await retryResp.text()}`);
-        const retryResult = await retryResp.json();
-        if (!retryResult.success || !retryResult.task_id) throw new Error(`AI33PRO TTS fallback rejected: ${JSON.stringify(retryResult)}`);
-        taskResult = await pollAI33ProTask(retryResult.task_id);
-      } else {
-        throw taskErr;
-      }
-    }
-
-    if (!taskResult.metadata?.audio_url) {
-      throw new Error("AI33PRO TTS: no audio_url in result");
-    }
-
-    const audioResp = await fetch(taskResult.metadata.audio_url);
-    if (!audioResp.ok) throw new Error(`Failed to download AI33PRO audio: ${audioResp.status}`);
-    const buffer = Buffer.from(await audioResp.arrayBuffer());
-    fs.writeFileSync(chunkPath, buffer);
-    return chunkPath;
-  };
-
-  // Process chunks in parallel batches of TTS_CONCURRENCY
   console.log(`  🚀 Processing ${chunks.length} TTS chunks (concurrency: ${Math.min(TTS_CONCURRENCY, chunks.length)})...`);
   for (let batchStart = 0; batchStart < chunks.length; batchStart += TTS_CONCURRENCY) {
     const batchEnd = Math.min(batchStart + TTS_CONCURRENCY, chunks.length);
@@ -419,50 +364,13 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
     fs.unlinkSync(listFile);
   }
 
-  console.log("  ✅ AI33PRO TTS success");
+  console.log("  ✅ Google Cloud TTS success");
 }
 
-// Generate TTS for a single segment (with optional stitching context)
+// Generate TTS for a single segment using Google Cloud TTS
 async function generateTTSSegment(text, outputPath, voiceId, targetLang, previousText, nextText) {
-  const modelId = getTTSModel(targetLang);
-  const langCode = LANG_CODE_MAP[targetLang] || null;
-  const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      model_id: modelId,
-      voice_settings: VOICE_SETTINGS,
-      ...(langCode ? { language_code: langCode } : {}),
-      // Request stitching: provide context from adjacent segments
-      ...(previousText ? { previous_text: previousText } : {}),
-      ...(nextText ? { next_text: nextText } : {}),
-    }),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`AI33PRO TTS segment error ${resp.status}: ${errText}`);
-  }
-
-  const result = await resp.json();
-  if (!result.success || !result.task_id) {
-    throw new Error(`AI33PRO TTS segment rejected: ${JSON.stringify(result)}`);
-  }
-  if (result.ec_remain_credits !== undefined && result.ec_remain_credits <= 0) {
-    throw new Error("AI33PRO out of credits");
-  }
-
-  const taskResult = await pollAI33ProTask(result.task_id);
-  if (!taskResult.metadata?.audio_url) {
-    throw new Error("AI33PRO TTS segment: no audio_url in result");
-  }
-
-  const audioResp = await fetch(taskResult.metadata.audio_url);
-  if (!audioResp.ok) throw new Error(`Failed to download segment audio: ${audioResp.status}`);
-
-  const buffer = Buffer.from(await audioResp.arrayBuffer());
-  fs.writeFileSync(outputPath, buffer);
+  const audioBuffer = await googleTTSSynthesize(text, targetLang, voiceId);
+  fs.writeFileSync(outputPath, audioBuffer);
 }
 
 // ── Translation ──
@@ -771,10 +679,9 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
             return;
           } catch (err) {
             const msg = String(err);
-            const isRetryable = msg.includes("429") || msg.includes("rate") || msg.includes("too many") || msg.includes("503") || msg.includes("timeout");
-            if (isRetryable && attempt < retries) {
+            if (attempt < retries) {
               const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
-              console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s...`);
+              console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${msg.slice(0, 120)}`);
               await new Promise(r => setTimeout(r, delay));
             } else {
               throw err;
@@ -785,12 +692,24 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
 
       // Parallel batches of SEG_TTS_CONCURRENCY
       console.log(`  🚀 Processing ${translatedSegments.length} TTS segments (concurrency: ${Math.min(SEG_TTS_CONCURRENCY, translatedSegments.length)})...`);
+      const failedSegs = [];
       for (let batchStart = 0; batchStart < translatedSegments.length; batchStart += SEG_TTS_CONCURRENCY) {
         const batchEnd = Math.min(batchStart + SEG_TTS_CONCURRENCY, translatedSegments.length);
         updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / translatedSegments.length) * 15),
           `TTS segments ${batchStart + 1}-${batchEnd}/${translatedSegments.length}...`);
         const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
-        await Promise.all(batchIndices.map(processSegTTS));
+        const results = await Promise.allSettled(batchIndices.map(processSegTTS));
+        for (let k = 0; k < results.length; k++) {
+          if (results[k].status === "rejected") {
+            const segIdx = batchIndices[k];
+            console.error(`  ❌ Seg ${segIdx + 1} FAILED permanently: ${results[k].reason}`);
+            failedSegs.push(segIdx);
+          }
+        }
+      }
+
+      if (failedSegs.length > 0) {
+        throw new Error(`TTS failed for ${failedSegs.length} segments: [${failedSegs.map(i => i + 1).join(", ")}]. Check AI33PRO credits/status.`);
       }
 
       // Build SRT and audio list sequentially from results
