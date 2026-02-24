@@ -1,13 +1,15 @@
 {
   "name": "vidlang-api",
   "version": "1.0.0",
-  "private": true,
+  "description": "Video language translation API with yt-dlp + FFmpeg + ElevenLabs",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.21.0",
+    "uuid": "^11.1.0",
     "cors": "^2.8.5",
-    "uuid": "^10.0.0"
+    "multer": "^1.4.5-lts.1"
   }
 }
