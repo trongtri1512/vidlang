@@ -266,6 +266,15 @@ const GOOGLE_VOICE_MAP = {
 // Google TTS has a 5000 byte limit per request
 const GOOGLE_TTS_MAX_BYTES = 4800;
 
+function shouldRetryTtsError(err) {
+  const msg = String(err?.message || err);
+  return !(
+    msg.includes("Google TTS error 400") ||
+    msg.includes("Google TTS error 401") ||
+    msg.includes("Google TTS error 403")
+  );
+}
+
 async function googleTTSSynthesize(text, targetLang, customVoiceName = null) {
   if (!GOOGLE_TTS_API_KEY) {
     throw new Error("GOOGLE_TTS_API_KEY is not configured (set GOOGLE_TTS_API_KEY or GOOGLE_TRANSLATE_API_KEY)");
@@ -306,6 +315,11 @@ async function googleTTSSynthesize(text, targetLang, customVoiceName = null) {
 
   if (!resp.ok) {
     const errText = await resp.text();
+    if (resp.status === 403) {
+      throw new Error(
+        `Google TTS error 403: API key chưa có quyền dùng Cloud Text-to-Speech hoặc API chưa được bật. Details: ${errText}`
+      );
+    }
     throw new Error(`Google TTS error ${resp.status}: ${errText}`);
   }
 
@@ -334,7 +348,7 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
         fs.writeFileSync(chunkPath, audioBuffer);
         return chunkPath;
       } catch (err) {
-        if (attempt < retries) {
+        if (attempt < retries && shouldRetryTtsError(err)) {
           const delay = Math.pow(2, attempt) * 500 + Math.random() * 500;
           console.log(`  🔄 Chunk ${i} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${String(err).slice(0, 120)}`);
           await new Promise(r => setTimeout(r, delay));
@@ -658,7 +672,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       // === Per-segment TTS: generate audio for each subtitle segment individually ===
       updateJob(jobId, "generating_voice", 70, "Generating voice per segment...");
       const translatedSegments = parseSrtToSegments(fs.readFileSync(srtPath, "utf-8"));
-      const voiceId = customVoiceId || VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
+      const voiceId = customVoiceId || GOOGLE_VOICE_MAP[targetLang]?.name || GOOGLE_VOICE_MAP.en.name;
       const segAudioFiles = [];
       let currentTime = 0;
       let newSrt = "";
@@ -679,7 +693,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
             return;
           } catch (err) {
             const msg = String(err);
-            if (attempt < retries) {
+            if (attempt < retries && shouldRetryTtsError(err)) {
               const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
               console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${msg.slice(0, 120)}`);
               await new Promise(r => setTimeout(r, delay));
@@ -709,7 +723,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       }
 
       if (failedSegs.length > 0) {
-        throw new Error(`TTS failed for ${failedSegs.length} segments: [${failedSegs.map(i => i + 1).join(", ")}]. Check AI33PRO credits/status.`);
+        throw new Error(`TTS failed for ${failedSegs.length} segments: [${failedSegs.map(i => i + 1).join(", ")}]. Vui lòng kiểm tra GOOGLE_TTS_API_KEY, API Cloud Text-to-Speech đã bật, và API restrictions của key.`);
       }
 
       // Build SRT and audio list sequentially from results
