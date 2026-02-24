@@ -2,7 +2,9 @@ FROM node:20-slim
 
 # Install system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv ffmpeg libass-dev fonts-noto-cjk curl \
+    python3 python3-pip python3-venv ffmpeg libass-dev \
+    fonts-noto-cjk fonts-noto-core fonts-noto-extra fonts-noto-color-emoji curl \
+    && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp
