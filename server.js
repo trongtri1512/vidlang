@@ -23,12 +23,7 @@ const AI33PRO_API_KEY = process.env.AI33PRO_API_KEY || "";
 const AI33PRO_BASE_URL = "https://api.ai33.pro";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 const GOOGLE_TRANSLATE_API_KEY = process.env.GOOGLE_TRANSLATE_API_KEY || "";
-const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || GOOGLE_TRANSLATE_API_KEY;
-
-// Modal.com XTTS v2 voice cloning
-const MODAL_XTTS_URL = process.env.MODAL_XTTS_URL || "";
-const MODAL_XTTS_BATCH_URL = process.env.MODAL_XTTS_BATCH_URL || "";
-const MODAL_API_SECRET = process.env.MODAL_API_SECRET || "";
+const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || GOOGLE_TRANSLATE_API_KEY; // Can reuse same Google Cloud API key
 
 const JOBS = {};
 
@@ -45,17 +40,14 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate" } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
-  if (mode === "dubbing" && !MODAL_XTTS_URL) {
-    return res.status(400).json({ error: "Video Dubbing not configured. Set MODAL_XTTS_URL in .env" });
-  }
 
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId, mode);
+  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -697,108 +689,9 @@ function parseYouTubeSubFile(workDir, sourceLang) {
   };
 }
 
-// ── Modal XTTS v2 Voice Cloning ──
-
-async function extractSpeakerAudio(videoPath, workDir, durationSec = 15) {
-  // Extract a reference audio clip from the original video for voice cloning
-  const refPath = `${workDir}/speaker_ref.wav`;
-  // Extract first N seconds of audio, convert to mono 22050Hz WAV
-  await run(`ffmpeg -y -i "${videoPath}" -vn -acodec pcm_s16le -ar 22050 -ac 1 -t ${durationSec} "${refPath}"`);
-  const audioBuffer = fs.readFileSync(refPath);
-  return audioBuffer.toString("base64");
-}
-
-async function modalXttsSynthesize(text, speakerAudioBase64, language) {
-  const resp = await fetch(MODAL_XTTS_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text,
-      speaker_audio_base64: speakerAudioBase64,
-      language,
-      api_secret: MODAL_API_SECRET,
-    }),
-  });
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`Modal XTTS error ${resp.status}: ${errText}`);
-  }
-  return await resp.json();
-}
-
-async function modalXttsBatchSynthesize(segments, speakerAudioBase64, language) {
-  const url = MODAL_XTTS_BATCH_URL || MODAL_XTTS_URL;
-  const isBatch = !!MODAL_XTTS_BATCH_URL;
-
-  if (isBatch) {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        segments,
-        speaker_audio_base64: speakerAudioBase64,
-        language,
-        api_secret: MODAL_API_SECRET,
-      }),
-    });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      throw new Error(`Modal XTTS batch error ${resp.status}: ${errText}`);
-    }
-    return await resp.json();
-  }
-
-  // Fallback: sequential calls to single endpoint
-  const results = [];
-  for (const seg of segments) {
-    try {
-      const result = await modalXttsSynthesize(seg.text, speakerAudioBase64, language);
-      results.push({ index: seg.index, ...result });
-    } catch (err) {
-      results.push({ index: seg.index, error: err.message, duration: 0 });
-    }
-  }
-  return { results };
-}
-
-async function generateDubbingTTS(translatedSegments, workDir, speakerAudioBase64, targetLang, jobId) {
-  console.log(`  🎙️ Generating dubbing with Modal XTTS v2 (${translatedSegments.length} segments)...`);
-
-  const BATCH_SIZE = 5; // Process N segments per Modal call
-  const segPaths = translatedSegments.map((_, i) => `${workDir}/dub_seg_${i}.wav`);
-  const segDurations = new Array(translatedSegments.length);
-
-  for (let batchStart = 0; batchStart < translatedSegments.length; batchStart += BATCH_SIZE) {
-    const batchEnd = Math.min(batchStart + BATCH_SIZE, translatedSegments.length);
-    updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / translatedSegments.length) * 15),
-      `Voice cloning segments ${batchStart + 1}-${batchEnd}/${translatedSegments.length}...`);
-
-    const batchSegs = [];
-    for (let i = batchStart; i < batchEnd; i++) {
-      batchSegs.push({ text: translatedSegments[i].text, index: i });
-    }
-
-    const batchResult = await modalXttsBatchSynthesize(batchSegs, speakerAudioBase64, targetLang);
-
-    for (const result of batchResult.results) {
-      const i = result.index;
-      if (result.error) {
-        throw new Error(`Voice cloning failed for segment ${i + 1}: ${result.error}`);
-      }
-      if (result.audio_base64) {
-        fs.writeFileSync(segPaths[i], Buffer.from(result.audio_base64, "base64"));
-        segDurations[i] = result.duration || await getMediaDuration(segPaths[i]);
-        console.log(`  🎙️ Dub seg ${i + 1}/${translatedSegments.length}: "${translatedSegments[i].text.substring(0, 30)}..." → ${segDurations[i].toFixed(2)}s`);
-      }
-    }
-  }
-
-  return { segPaths, segDurations };
-}
-
 // ── Processing pipeline ──
 
-async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false, customVoiceId = null, mode = "translate") {
+async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false, customVoiceId = null) {
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
@@ -871,83 +764,71 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     fs.writeFileSync(`${workDir}/translated.txt`, translatedText);
 
     // ── TTS Generation ──
-    // Extract speaker reference audio for dubbing mode
-    let speakerAudioBase64 = null;
-    if (mode === "dubbing") {
-      updateJob(jobId, "generating_voice", 68, "Extracting speaker voice sample...");
-      speakerAudioBase64 = await extractSpeakerAudio(`${workDir}/video.mp4`, workDir);
-      console.log(`  🎤 Speaker reference audio extracted (${(Buffer.from(speakerAudioBase64, "base64").length / 1024).toFixed(0)} KB)`);
-    }
-
     if (enableSubtitles && srtPath && transcript.segments && transcript.segments.length > 0) {
-      // === Per-segment TTS ===
-      updateJob(jobId, "generating_voice", 70, mode === "dubbing" ? "Voice cloning per segment..." : "Generating voice per segment...");
+      // === Per-segment TTS: generate audio for each subtitle segment individually ===
+      updateJob(jobId, "generating_voice", 70, "Generating voice per segment...");
       const translatedSegments = parseSrtToSegments(fs.readFileSync(srtPath, "utf-8"));
+      const voiceId = customVoiceId || GOOGLE_VOICE_MAP[targetLang]?.name || GOOGLE_VOICE_MAP.en.name;
       const segAudioFiles = [];
       let currentTime = 0;
       let newSrt = "";
-      let segPaths, segDurations;
 
-      if (mode === "dubbing") {
-        // ── DUBBING MODE: Modal XTTS v2 voice cloning ──
-        const dubResult = await generateDubbingTTS(translatedSegments, workDir, speakerAudioBase64, targetLang, jobId);
-        segPaths = dubResult.segPaths;
-        segDurations = dubResult.segDurations;
-      } else {
-        // ── TRANSLATE MODE: Google TTS (existing flow) ──
-        const voiceId = customVoiceId || GOOGLE_VOICE_MAP[targetLang]?.name || GOOGLE_VOICE_MAP.en.name;
-        segPaths = translatedSegments.map((_, i) => `${workDir}/seg_${i}.mp3`);
-        segDurations = new Array(translatedSegments.length);
+      const SEG_TTS_CONCURRENCY = 5; // Reduced to avoid 429 rate limits
+      const segDurations = new Array(translatedSegments.length);
+      const segPaths = translatedSegments.map((_, i) => `${workDir}/seg_${i}.mp3`);
 
-        const SEG_TTS_CONCURRENCY = 5;
-        const processSegTTS = async (i, retries = 5) => {
-          for (let attempt = 1; attempt <= retries; attempt++) {
-            try {
-              const prevText = i > 0 ? translatedSegments[i - 1].text : null;
-              const nextTextCtx = i < translatedSegments.length - 1 ? translatedSegments[i + 1].text : null;
-              await generateTTSSegment(translatedSegments[i].text, segPaths[i], voiceId, targetLang, prevText, nextTextCtx);
-              segDurations[i] = await getMediaDuration(segPaths[i]);
-              console.log(`  🎙️ Seg ${i + 1}/${translatedSegments.length}: "${translatedSegments[i].text.substring(0, 30)}..." → ${segDurations[i].toFixed(2)}s`);
-              return;
-            } catch (err) {
-              if (attempt < retries && shouldRetryTtsError(err)) {
-                const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
-                console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${String(err).slice(0, 120)}`);
-                await new Promise(r => setTimeout(r, delay));
-              } else {
-                throw err;
-              }
-            }
-          }
-        };
-
-        console.log(`  🚀 Processing ${translatedSegments.length} TTS segments (concurrency: ${Math.min(SEG_TTS_CONCURRENCY, translatedSegments.length)})...`);
-        const failedSegs = [];
-        for (let batchStart = 0; batchStart < translatedSegments.length; batchStart += SEG_TTS_CONCURRENCY) {
-          const batchEnd = Math.min(batchStart + SEG_TTS_CONCURRENCY, translatedSegments.length);
-          updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / translatedSegments.length) * 15),
-            `TTS segments ${batchStart + 1}-${batchEnd}/${translatedSegments.length}...`);
-          const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
-          const results = await Promise.allSettled(batchIndices.map(i => processSegTTS(i)));
-          for (let k = 0; k < results.length; k++) {
-            if (results[k].status === "rejected") {
-              failedSegs.push(batchIndices[k]);
+      // Process segment TTS with retry + exponential backoff + jitter
+      const processSegTTS = async (i, retries = 5) => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+          try {
+            const prevText = i > 0 ? translatedSegments[i - 1].text : null;
+            const nextTextCtx = i < translatedSegments.length - 1 ? translatedSegments[i + 1].text : null;
+            await generateTTSSegment(translatedSegments[i].text, segPaths[i], voiceId, targetLang, prevText, nextTextCtx);
+            segDurations[i] = await getMediaDuration(segPaths[i]);
+            console.log(`  🎙️ Seg ${i + 1}/${translatedSegments.length}: "${translatedSegments[i].text.substring(0, 30)}..." → ${segDurations[i].toFixed(2)}s`);
+            return;
+          } catch (err) {
+            const msg = String(err);
+            if (attempt < retries && shouldRetryTtsError(err)) {
+              const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+              console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${msg.slice(0, 120)}`);
+              await new Promise(r => setTimeout(r, delay));
+            } else {
+              throw err;
             }
           }
         }
+      };
 
-        if (failedSegs.length > 0) {
-          throw new Error(`TTS failed for ${failedSegs.length} segments: [${failedSegs.map(i => i + 1).join(", ")}].`);
+      // Parallel batches of SEG_TTS_CONCURRENCY
+      console.log(`  🚀 Processing ${translatedSegments.length} TTS segments (concurrency: ${Math.min(SEG_TTS_CONCURRENCY, translatedSegments.length)})...`);
+      const failedSegs = [];
+      for (let batchStart = 0; batchStart < translatedSegments.length; batchStart += SEG_TTS_CONCURRENCY) {
+        const batchEnd = Math.min(batchStart + SEG_TTS_CONCURRENCY, translatedSegments.length);
+        updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / translatedSegments.length) * 15),
+          `TTS segments ${batchStart + 1}-${batchEnd}/${translatedSegments.length}...`);
+        const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
+        const results = await Promise.allSettled(batchIndices.map(i => processSegTTS(i)));
+        for (let k = 0; k < results.length; k++) {
+          if (results[k].status === "rejected") {
+            const segIdx = batchIndices[k];
+            console.error(`  ❌ Seg ${segIdx + 1} FAILED permanently: ${results[k].reason}`);
+            failedSegs.push(segIdx);
+          }
         }
       }
 
-      // Verify all segment files exist
-      const missingFiles = segPaths.filter((f) => !fs.existsSync(f));
+      if (failedSegs.length > 0) {
+        throw new Error(`TTS failed for ${failedSegs.length} segments: [${failedSegs.map(i => i + 1).join(", ")}]. Vui lòng kiểm tra GOOGLE_TTS_API_KEY, API Cloud Text-to-Speech đã bật, và API restrictions của key.`);
+      }
+
+      // Verify all segment files exist before proceeding
+      const missingFiles = segPaths.filter((f, i) => !fs.existsSync(f));
       if (missingFiles.length > 0) {
-        throw new Error(`TTS completed but ${missingFiles.length} audio files are missing.`);
+        throw new Error(`TTS completed but ${missingFiles.length} audio files are missing. Google TTS API có thể chưa được bật hoặc API key không hợp lệ.`);
       }
 
-      // Build SRT and audio list
+      // Build SRT and audio list sequentially from results
       for (let i = 0; i < translatedSegments.length; i++) {
         const segStart = currentTime;
         const segEnd = currentTime + segDurations[i];
@@ -956,34 +837,23 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         currentTime = segEnd;
       }
 
+      // Write re-timed SRT
       fs.writeFileSync(srtPath, newSrt, "utf-8");
-      console.log(`  ✅ SRT re-timed (total: ${currentTime.toFixed(1)}s)`);
+      console.log(`  ✅ SRT re-timed from actual TTS durations (total: ${currentTime.toFixed(1)}s)`);
 
+      // Concatenate all segment audio files into one
       updateJob(jobId, "generating_voice", 86, "Concatenating audio segments...");
       const listFile = `${workDir}/seg_list.txt`;
       fs.writeFileSync(listFile, segAudioFiles.map((f) => `file '${f}'`).join("\n"));
-      const audioExt = mode === "dubbing" ? "wav" : "mp3";
-      await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${workDir}/tts_audio.${audioExt}"`);
-      // Convert WAV to MP3 if dubbing
-      if (mode === "dubbing") {
-        await run(`ffmpeg -y -i "${workDir}/tts_audio.wav" -acodec libmp3lame -b:a 192k "${workDir}/tts_audio.mp3"`);
-      }
+      await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${workDir}/tts_audio.mp3"`);
 
+      // Cleanup segment files
       segAudioFiles.forEach((f) => { try { fs.unlinkSync(f); } catch (_) {} });
       try { fs.unlinkSync(listFile); } catch (_) {}
     } else {
-      // No subtitles
-      if (mode === "dubbing") {
-        // Dubbing without subtitles: generate single voice-cloned audio
-        updateJob(jobId, "generating_voice", 70, "Voice cloning full text...");
-        const result = await modalXttsSynthesize(translatedText, speakerAudioBase64, targetLang);
-        if (result.error) throw new Error(`Voice cloning failed: ${result.error}`);
-        fs.writeFileSync(`${workDir}/tts_audio.wav`, Buffer.from(result.audio_base64, "base64"));
-        await run(`ffmpeg -y -i "${workDir}/tts_audio.wav" -acodec libmp3lame -b:a 192k "${workDir}/tts_audio.mp3"`);
-      } else {
-        updateJob(jobId, "generating_voice", 70);
-        await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang, customVoiceId);
-      }
+      // No subtitles: single TTS for entire text
+      updateJob(jobId, "generating_voice", 70);
+      await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang, customVoiceId);
     }
 
     updateJob(jobId, "merging", 90);
