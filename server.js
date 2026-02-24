@@ -39,14 +39,14 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles);
+  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -264,7 +264,10 @@ const VOICE_MAP = {
 };
 
 // Languages that require Flash v2.5 (not supported by multilingual v2)
-const FLASH_ONLY_LANGS = ["vi", "hu", "no"];
+const FLASH_ONLY_LANGS = ["hu", "no"];
+
+// Languages that use ElevenLabs v3 model
+const V3_LANGS = ["vi"];
 
 // ElevenLabs language codes for explicit language hints
 const LANG_CODE_MAP = {
@@ -274,6 +277,9 @@ const LANG_CODE_MAP = {
 };
 
 function getTTSModel(targetLang) {
+  if (V3_LANGS.includes(targetLang)) {
+    return "eleven_v3";
+  }
   if (FLASH_ONLY_LANGS.includes(targetLang)) {
     return "eleven_flash_v2_5";
   }
@@ -289,7 +295,7 @@ const VOICE_SETTINGS = {
   speed: 1.0,
 };
 
-async function generateTTS(text, outputPath, targetLang) {
+async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
   }
@@ -297,7 +303,7 @@ async function generateTTS(text, outputPath, targetLang) {
   const modelId = getTTSModel(targetLang);
   const langCode = LANG_CODE_MAP[targetLang] || null;
   console.log(`  🔊 Generating TTS with AI33PRO (model: ${modelId}, lang: ${langCode || 'auto'})...`);
-  const voiceId = VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
+  const voiceId = customVoiceId || VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
 
   // Split long text into chunks
   const chunks = splitText(text, 4500);
@@ -614,7 +620,7 @@ function parseYouTubeSubFile(workDir, sourceLang) {
 
 // ── Processing pipeline ──
 
-async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false) {
+async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false, customVoiceId = null) {
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
@@ -691,7 +697,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       // === Per-segment TTS: generate audio for each subtitle segment individually ===
       updateJob(jobId, "generating_voice", 70, "Generating voice per segment...");
       const translatedSegments = parseSrtToSegments(fs.readFileSync(srtPath, "utf-8"));
-      const voiceId = VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
+      const voiceId = customVoiceId || VOICE_MAP[targetLang] || ELEVENLABS_VOICE_ID;
       const segAudioFiles = [];
       let currentTime = 0;
       let newSrt = "";
@@ -737,7 +743,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     } else {
       // No subtitles: single TTS for entire text
       updateJob(jobId, "generating_voice", 70);
-      await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang);
+      await generateTTS(translatedText, `${workDir}/tts_audio.mp3`, targetLang, customVoiceId);
     }
 
     updateJob(jobId, "merging", 90);
