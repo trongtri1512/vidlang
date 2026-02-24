@@ -755,29 +755,51 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       let currentTime = 0;
       let newSrt = "";
 
+      const SEG_TTS_CONCURRENCY = 20;
+      const segDurations = new Array(translatedSegments.length);
+      const segPaths = translatedSegments.map((_, i) => `${workDir}/seg_${i}.mp3`);
+
+      // Process segment TTS with retry
+      const processSegTTS = async (i, retries = 3) => {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+          try {
+            const prevText = i > 0 ? translatedSegments[i - 1].text : null;
+            const nextTextCtx = i < translatedSegments.length - 1 ? translatedSegments[i + 1].text : null;
+            await generateTTSSegment(translatedSegments[i].text, segPaths[i], voiceId, targetLang, prevText, nextTextCtx);
+            segDurations[i] = await getMediaDuration(segPaths[i]);
+            console.log(`  🎙️ Seg ${i + 1}/${translatedSegments.length}: "${translatedSegments[i].text.substring(0, 30)}..." → ${segDurations[i].toFixed(2)}s`);
+            return;
+          } catch (err) {
+            const msg = String(err);
+            const isRetryable = msg.includes("429") || msg.includes("rate") || msg.includes("too many") || msg.includes("503") || msg.includes("timeout");
+            if (isRetryable && attempt < retries) {
+              const delay = attempt * 3000;
+              console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${delay / 1000}s...`);
+              await new Promise(r => setTimeout(r, delay));
+            } else {
+              throw err;
+            }
+          }
+        }
+      };
+
+      // Parallel batches of SEG_TTS_CONCURRENCY
+      console.log(`  🚀 Processing ${translatedSegments.length} TTS segments (concurrency: ${Math.min(SEG_TTS_CONCURRENCY, translatedSegments.length)})...`);
+      for (let batchStart = 0; batchStart < translatedSegments.length; batchStart += SEG_TTS_CONCURRENCY) {
+        const batchEnd = Math.min(batchStart + SEG_TTS_CONCURRENCY, translatedSegments.length);
+        updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / translatedSegments.length) * 15),
+          `TTS segments ${batchStart + 1}-${batchEnd}/${translatedSegments.length}...`);
+        const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
+        await Promise.all(batchIndices.map(processSegTTS));
+      }
+
+      // Build SRT and audio list sequentially from results
       for (let i = 0; i < translatedSegments.length; i++) {
-        const seg = translatedSegments[i];
-        const segAudioPath = `${workDir}/seg_${i}.mp3`;
-
-        updateJob(jobId, "generating_voice", 70 + Math.floor((i / translatedSegments.length) * 15),
-          `TTS segment ${i + 1}/${translatedSegments.length}...`);
-
-        // Generate TTS for this single segment with stitching context
-        const prevText = i > 0 ? translatedSegments[i - 1].text : null;
-        const nextTextCtx = i < translatedSegments.length - 1 ? translatedSegments[i + 1].text : null;
-        await generateTTSSegment(seg.text, segAudioPath, voiceId, targetLang, prevText, nextTextCtx);
-
-        // Measure actual duration of this segment's audio
-        const segDuration = await getMediaDuration(segAudioPath);
         const segStart = currentTime;
-        const segEnd = currentTime + segDuration;
-
-        // Build SRT entry with real timing
-        newSrt += `${i + 1}\n${secondsToSrtTime(segStart)} --> ${secondsToSrtTime(segEnd)}\n${seg.text}\n\n`;
-        segAudioFiles.push(segAudioPath);
+        const segEnd = currentTime + segDurations[i];
+        newSrt += `${i + 1}\n${secondsToSrtTime(segStart)} --> ${secondsToSrtTime(segEnd)}\n${translatedSegments[i].text}\n\n`;
+        segAudioFiles.push(segPaths[i]);
         currentTime = segEnd;
-
-        console.log(`  🎙️ Seg ${i + 1}/${translatedSegments.length}: "${seg.text.substring(0, 30)}..." → ${segDuration.toFixed(2)}s`);
       }
 
       // Write re-timed SRT
