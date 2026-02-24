@@ -172,10 +172,16 @@ async function transcribeAudio(filePath, jobId = null) {
     const jsonData = await jsonResp.json();
     console.log("  ✅ AI33PRO STT success");
     if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
+    const rawSegments = jsonData.segments || jsonData.chunks || null;
+    const fullText = jsonData.text || extractTextFromJson(jsonData);
+    // If no segments from API, generate them from text (split by sentences)
+    const segments = rawSegments && rawSegments.length > 0
+      ? rawSegments
+      : generateSegmentsFromText(fullText);
     return {
-      text: jsonData.text || extractTextFromJson(jsonData),
+      text: fullText,
       language: jsonData.language || "auto",
-      segments: jsonData.segments || jsonData.chunks || null,
+      segments,
     };
   }
 
@@ -201,8 +207,30 @@ function extractTextFromJson(data) {
   if (data.words) return data.words.map((w) => w.text || w.word || w).join(" ");
   return JSON.stringify(data);
 }
+// Generate pseudo-segments from plain text when STT doesn't provide timestamps
+// Splits by sentences, assigns estimated timestamps (~150 words/min speaking rate)
+function generateSegmentsFromText(text) {
+  if (!text || text.trim().length === 0) return [];
+  // Split by sentence-ending punctuation
+  const sentences = text.match(/[^.!?。！？]+[.!?。！？]+|[^.!?。！？]+$/g) || [text];
+  const segments = [];
+  let currentTime = 0;
+  for (const sentence of sentences) {
+    const trimmed = sentence.trim();
+    if (!trimmed) continue;
+    // Estimate duration: ~2.5 words/sec or ~8 chars/sec for CJK
+    const isCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
+    const duration = isCJK
+      ? Math.max(1, trimmed.length * 0.15)
+      : Math.max(1, trimmed.split(/\s+/).length / 2.5);
+    segments.push({ start: currentTime, end: currentTime + duration, text: trimmed });
+    currentTime += duration;
+  }
+  console.log(`  📝 Generated ${segments.length} pseudo-segments from text (total: ${currentTime.toFixed(1)}s estimated)`);
+  return segments;
+}
 
-function parseSrtToText(srt) {
+
   return srt
     .split("\n")
     .filter((line) => line.trim() && !/^\d+$/.test(line.trim()) && !line.includes("-->"))
@@ -382,9 +410,34 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
 }
 
 // Generate TTS for a single segment using Google Cloud TTS
+// Handles segments longer than Google's 5000 byte limit by splitting and concatenating
 async function generateTTSSegment(text, outputPath, voiceId, targetLang, previousText, nextText) {
-  const audioBuffer = await googleTTSSynthesize(text, targetLang, voiceId);
-  fs.writeFileSync(outputPath, audioBuffer);
+  const byteLength = Buffer.byteLength(text, "utf-8");
+  if (byteLength <= GOOGLE_TTS_MAX_BYTES) {
+    const audioBuffer = await googleTTSSynthesize(text, targetLang, voiceId);
+    fs.writeFileSync(outputPath, audioBuffer);
+    return;
+  }
+
+  // Text exceeds limit — split into sub-chunks
+  const subChunks = splitText(text, GOOGLE_TTS_MAX_BYTES);
+  console.log(`  ⚠️ Segment too long (${byteLength} bytes), splitting into ${subChunks.length} sub-chunks`);
+  const subFiles = [];
+  for (let j = 0; j < subChunks.length; j++) {
+    const subPath = outputPath.replace(".mp3", `_sub${j}.mp3`);
+    const audioBuffer = await googleTTSSynthesize(subChunks[j], targetLang, voiceId);
+    fs.writeFileSync(subPath, audioBuffer);
+    subFiles.push(subPath);
+  }
+  if (subFiles.length === 1) {
+    fs.renameSync(subFiles[0], outputPath);
+  } else {
+    const listFile = outputPath.replace(".mp3", "_sublist.txt");
+    fs.writeFileSync(listFile, subFiles.map((f) => `file '${f}'`).join("\n"));
+    await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${outputPath}"`);
+    subFiles.forEach((f) => { try { fs.unlinkSync(f); } catch (_) {} });
+    try { fs.unlinkSync(listFile); } catch (_) {}
+  }
 }
 
 // ── Translation ──
