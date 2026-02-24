@@ -726,6 +726,12 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         throw new Error(`TTS failed for ${failedSegs.length} segments: [${failedSegs.map(i => i + 1).join(", ")}]. Vui lòng kiểm tra GOOGLE_TTS_API_KEY, API Cloud Text-to-Speech đã bật, và API restrictions của key.`);
       }
 
+      // Verify all segment files exist before proceeding
+      const missingFiles = segPaths.filter((f, i) => !fs.existsSync(f));
+      if (missingFiles.length > 0) {
+        throw new Error(`TTS completed but ${missingFiles.length} audio files are missing. Google TTS API có thể chưa được bật hoặc API key không hợp lệ.`);
+      }
+
       // Build SRT and audio list sequentially from results
       for (let i = 0; i < translatedSegments.length; i++) {
         const segStart = currentTime;
