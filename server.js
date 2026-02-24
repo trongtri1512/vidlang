@@ -315,10 +315,10 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
   const chunks = splitText(text, 4500);
   const chunkFiles = [];
 
-  const TTS_CONCURRENCY = 20; // Process up to 20 chunks in parallel
+  const TTS_CONCURRENCY = 5; // Reduced to avoid 429 rate limits
 
-  // Helper: process a single chunk with retry on rate limit / transient errors
-  const processChunk = async (i, retries = 3) => {
+  // Helper: process a single chunk with retry + exponential backoff + jitter
+  const processChunk = async (i, retries = 5) => {
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         return await _processChunkOnce(i);
@@ -326,8 +326,8 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
         const msg = String(err);
         const isRetryable = msg.includes("429") || msg.includes("rate") || msg.includes("too many") || msg.includes("503") || msg.includes("timeout");
         if (isRetryable && attempt < retries) {
-          const delay = attempt * 3000; // 3s, 6s backoff
-          console.log(`  🔄 Chunk ${i} failed (attempt ${attempt}/${retries}), retrying in ${delay / 1000}s: ${msg.slice(0, 100)}`);
+          const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+          console.log(`  🔄 Chunk ${i} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s: ${msg.slice(0, 100)}`);
           await new Promise(r => setTimeout(r, delay));
         } else {
           throw err;
@@ -755,12 +755,12 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       let currentTime = 0;
       let newSrt = "";
 
-      const SEG_TTS_CONCURRENCY = 20;
+      const SEG_TTS_CONCURRENCY = 5; // Reduced to avoid 429 rate limits
       const segDurations = new Array(translatedSegments.length);
       const segPaths = translatedSegments.map((_, i) => `${workDir}/seg_${i}.mp3`);
 
-      // Process segment TTS with retry
-      const processSegTTS = async (i, retries = 3) => {
+      // Process segment TTS with retry + exponential backoff + jitter
+      const processSegTTS = async (i, retries = 5) => {
         for (let attempt = 1; attempt <= retries; attempt++) {
           try {
             const prevText = i > 0 ? translatedSegments[i - 1].text : null;
@@ -773,8 +773,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
             const msg = String(err);
             const isRetryable = msg.includes("429") || msg.includes("rate") || msg.includes("too many") || msg.includes("503") || msg.includes("timeout");
             if (isRetryable && attempt < retries) {
-              const delay = attempt * 3000;
-              console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${delay / 1000}s...`);
+              const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+              console.log(`  🔄 Seg ${i + 1} failed (attempt ${attempt}/${retries}), retrying in ${(delay / 1000).toFixed(1)}s...`);
               await new Promise(r => setTimeout(r, delay));
             } else {
               throw err;
