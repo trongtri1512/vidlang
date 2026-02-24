@@ -315,21 +315,43 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
   const chunks = splitText(text, 4500);
   const chunkFiles = [];
 
-  for (let i = 0; i < chunks.length; i++) {
+  const TTS_CONCURRENCY = 20; // Process up to 20 chunks in parallel
+
+  // Helper: process a single chunk with retry on rate limit / transient errors
+  const processChunk = async (i, retries = 3) => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await _processChunkOnce(i);
+      } catch (err) {
+        const msg = String(err);
+        const isRetryable = msg.includes("429") || msg.includes("rate") || msg.includes("too many") || msg.includes("503") || msg.includes("timeout");
+        if (isRetryable && attempt < retries) {
+          const delay = attempt * 3000; // 3s, 6s backoff
+          console.log(`  🔄 Chunk ${i} failed (attempt ${attempt}/${retries}), retrying in ${delay / 1000}s: ${msg.slice(0, 100)}`);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          throw err;
+        }
+      }
+    }
+  };
+
+  const _processChunkOnce = async (i) => {
     const chunkPath = outputPath.replace(".mp3", `_chunk${i}.mp3`);
+
+    const bodyPayload = {
+      text: chunks[i],
+      model_id: modelId,
+      voice_settings: modelId === "eleven_v3" ? VOICE_SETTINGS_V3 : VOICE_SETTINGS,
+      ...(langCode ? { language_code: langCode } : {}),
+      ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
+      ...(i < chunks.length - 1 ? { next_text: chunks[i + 1].slice(0, 200) } : {}),
+    };
 
     const resp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: chunks[i],
-        model_id: modelId,
-        voice_settings: modelId === "eleven_v3" ? VOICE_SETTINGS_V3 : VOICE_SETTINGS,
-        ...(langCode ? { language_code: langCode } : {}),
-        // Request stitching for multi-chunk
-        ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
-        ...(i < chunks.length - 1 ? { next_text: chunks[i + 1].slice(0, 200) } : {}),
-      }),
+      body: JSON.stringify(bodyPayload),
     });
 
     if (!resp.ok) {
@@ -338,11 +360,9 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
     }
 
     const result = await resp.json();
-
     if (!result.success || !result.task_id) {
       throw new Error(`AI33PRO TTS rejected: ${JSON.stringify(result)}`);
     }
-
     if (result.ec_remain_credits !== undefined && result.ec_remain_credits <= 0) {
       throw new Error("AI33PRO out of credits");
     }
@@ -351,30 +371,17 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
     try {
       taskResult = await pollAI33ProTask(result.task_id);
     } catch (taskErr) {
-      // Fallback: if eleven_v3 fails (e.g. invalid_ttd_stability), retry with eleven_flash_v2_5
       if (modelId === "eleven_v3" && String(taskErr).includes("invalid_ttd_stability")) {
         const fallbackModel = "eleven_flash_v2_5";
         console.log(`  ⚠️ eleven_v3 failed, retrying chunk ${i} with ${fallbackModel}...`);
         const retryResp = await ai33proRequest(`/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: chunks[i],
-            model_id: fallbackModel,
-            voice_settings: VOICE_SETTINGS,
-            ...(langCode ? { language_code: langCode } : {}),
-            ...(i > 0 ? { previous_text: chunks[i - 1].slice(-200) } : {}),
-            ...(i < chunks.length - 1 ? { next_text: chunks[i + 1].slice(0, 200) } : {}),
-          }),
+          body: JSON.stringify({ ...bodyPayload, model_id: fallbackModel, voice_settings: VOICE_SETTINGS }),
         });
-        if (!retryResp.ok) {
-          const errText = await retryResp.text();
-          throw new Error(`AI33PRO TTS fallback error ${retryResp.status}: ${errText}`);
-        }
+        if (!retryResp.ok) throw new Error(`AI33PRO TTS fallback error ${retryResp.status}: ${await retryResp.text()}`);
         const retryResult = await retryResp.json();
-        if (!retryResult.success || !retryResult.task_id) {
-          throw new Error(`AI33PRO TTS fallback rejected: ${JSON.stringify(retryResult)}`);
-        }
+        if (!retryResult.success || !retryResult.task_id) throw new Error(`AI33PRO TTS fallback rejected: ${JSON.stringify(retryResult)}`);
         taskResult = await pollAI33ProTask(retryResult.task_id);
       } else {
         throw taskErr;
@@ -387,10 +394,18 @@ async function generateTTS(text, outputPath, targetLang, customVoiceId = null) {
 
     const audioResp = await fetch(taskResult.metadata.audio_url);
     if (!audioResp.ok) throw new Error(`Failed to download AI33PRO audio: ${audioResp.status}`);
-
     const buffer = Buffer.from(await audioResp.arrayBuffer());
     fs.writeFileSync(chunkPath, buffer);
-    chunkFiles.push(chunkPath);
+    return chunkPath;
+  };
+
+  // Process chunks in parallel batches of TTS_CONCURRENCY
+  console.log(`  🚀 Processing ${chunks.length} TTS chunks (concurrency: ${Math.min(TTS_CONCURRENCY, chunks.length)})...`);
+  for (let batchStart = 0; batchStart < chunks.length; batchStart += TTS_CONCURRENCY) {
+    const batchEnd = Math.min(batchStart + TTS_CONCURRENCY, chunks.length);
+    const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
+    const results = await Promise.all(batchIndices.map(processChunk));
+    chunkFiles.push(...results);
   }
 
   // Concat chunks if multiple
