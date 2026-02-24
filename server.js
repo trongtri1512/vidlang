@@ -859,13 +859,35 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
   }
 }
 
-function splitText(text, maxLen) {
+function splitText(text, maxBytes) {
   const chunks = [];
   let remaining = text;
-  while (remaining.length > maxLen) {
-    let splitAt = remaining.lastIndexOf(". ", maxLen);
-    if (splitAt === -1) splitAt = maxLen;
-    else splitAt += 1;
+  while (Buffer.byteLength(remaining, "utf-8") > maxBytes) {
+    // Find a split point that keeps the chunk under maxBytes
+    let splitAt = -1;
+    // Try splitting at sentence boundaries first
+    for (let i = Math.min(remaining.length, maxBytes); i > 0; i--) {
+      if (remaining[i] === "." || remaining[i] === "。" || remaining[i] === "!" || remaining[i] === "?" || remaining[i] === "\n") {
+        const candidate = remaining.substring(0, i + 1);
+        if (Buffer.byteLength(candidate, "utf-8") <= maxBytes) {
+          splitAt = i + 1;
+          break;
+        }
+      }
+    }
+    // Fallback: binary search for max chars that fit in maxBytes
+    if (splitAt === -1) {
+      let lo = 1, hi = Math.min(remaining.length, maxBytes);
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (Buffer.byteLength(remaining.substring(0, mid), "utf-8") <= maxBytes) {
+          lo = mid;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      splitAt = lo;
+    }
     chunks.push(remaining.substring(0, splitAt).trim());
     remaining = remaining.substring(splitAt).trim();
   }
