@@ -208,22 +208,65 @@ function extractTextFromJson(data) {
   return JSON.stringify(data);
 }
 // Generate pseudo-segments from plain text when STT doesn't provide timestamps
-// Splits by sentences, assigns estimated timestamps (~150 words/min speaking rate)
+// Splits by sentences first, then further splits long sentences into ~80 char chunks
 function generateSegmentsFromText(text) {
   if (!text || text.trim().length === 0) return [];
-  // Split by sentence-ending punctuation
-  const sentences = text.match(/[^.!?。！？]+[.!?。！？]+|[^.!?。！？]+$/g) || [text];
-  const segments = [];
-  let currentTime = 0;
-  for (const sentence of sentences) {
+  
+  const MAX_CHARS = 80; // Max chars per subtitle line
+  
+  // Split by sentence-ending punctuation (including comma/semicolon for long texts)
+  const rawSentences = text.match(/[^.!?。！？;；]+[.!?。！？;；]+|[^.!?。！？;；]+$/g) || [text];
+  
+  // Further split long sentences into smaller chunks
+  const chunks = [];
+  for (const sentence of rawSentences) {
     const trimmed = sentence.trim();
     if (!trimmed) continue;
+    if (trimmed.length <= MAX_CHARS) {
+      chunks.push(trimmed);
+    } else {
+      // Split by comma, colon, or natural break points
+      const parts = trimmed.match(/[^,，:：]+[,，:：]?/g) || [trimmed];
+      let buffer = "";
+      for (const part of parts) {
+        if (buffer.length + part.length > MAX_CHARS && buffer.length > 0) {
+          chunks.push(buffer.trim());
+          buffer = part;
+        } else {
+          buffer += part;
+        }
+      }
+      if (buffer.trim()) {
+        // If still too long, force split by word boundaries
+        const remaining = buffer.trim();
+        if (remaining.length > MAX_CHARS) {
+          const words = remaining.split(/\s+/);
+          let wordBuffer = "";
+          for (const word of words) {
+            if (wordBuffer.length + word.length + 1 > MAX_CHARS && wordBuffer.length > 0) {
+              chunks.push(wordBuffer.trim());
+              wordBuffer = word;
+            } else {
+              wordBuffer += (wordBuffer ? " " : "") + word;
+            }
+          }
+          if (wordBuffer.trim()) chunks.push(wordBuffer.trim());
+        } else {
+          chunks.push(remaining);
+        }
+      }
+    }
+  }
+  
+  const segments = [];
+  let currentTime = 0;
+  for (const chunk of chunks) {
     // Estimate duration: ~2.5 words/sec or ~8 chars/sec for CJK
-    const isCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(trimmed);
+    const isCJK = /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(chunk);
     const duration = isCJK
-      ? Math.max(1, trimmed.length * 0.15)
-      : Math.max(1, trimmed.split(/\s+/).length / 2.5);
-    segments.push({ start: currentTime, end: currentTime + duration, text: trimmed });
+      ? Math.max(1, chunk.length * 0.15)
+      : Math.max(1, chunk.split(/\s+/).length / 2.5);
+    segments.push({ start: currentTime, end: currentTime + duration, text: chunk });
     currentTime += duration;
   }
   console.log(`  📝 Generated ${segments.length} pseudo-segments from text (total: ${currentTime.toFixed(1)}s estimated)`);
