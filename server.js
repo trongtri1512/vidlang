@@ -215,60 +215,85 @@ async function ai84proDubbing(filePath, sourceLang, targetLang, jobId, chunkLabe
   const cleanTargetLang = sanitizeDubbingLang(targetLang, { fallback: "en" });
   const cleanSourceLang = sanitizeDubbingLang(sourceLang, { fallback: "detect", allowDetect: true });
 
-  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel}: file=${filePath} (${fileBuffer.length} bytes), target_lang="${cleanTargetLang}", source_lang="${cleanSourceLang}"`);
+  const pollAi84Job = async (ai84JobId, includeSourceLang) => {
+    const maxWait = 7200000;
+    const start = Date.now();
 
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("target_lang", cleanTargetLang);
-  formData.append("source_lang", cleanSourceLang);
+    while (Date.now() - start < maxWait) {
+      const statusResp = await ai84proRequest(`/v2/dubbing/${ai84JobId}`, { method: "GET" });
+      if (!statusResp.ok) throw new Error(`AI84PRO poll error ${statusResp.status}`);
+      const statusData = await statusResp.json();
 
-  const resp = await ai84proRequest("/v2/dubbing", {
-    method: "POST",
-    body: formData,
-  });
+      if (statusData.job?.status === "done") {
+        return statusData.job;
+      }
+      if (statusData.job?.status === "error" || statusData.job?.status === "failed") {
+        throw new Error(`AI84PRO dubbing failed: ${statusData.job.errorMessage || "unknown error"}`);
+      }
 
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`AI84PRO dubbing error ${resp.status}: ${errText}`);
-  }
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      if (jobId) {
+        updateJob(jobId, "generating_voice", Math.min(88, 70 + Math.floor((Date.now() - start) / maxWait * 18)),
+          `AI84PRO dubbing chunk ${chunkLabel} (${elapsed}s, ${statusData.job?.progress || 0}%, ${includeSourceLang ? "with source" : "auto source"})...`);
+      }
 
-  const result = await resp.json();
-  const ai84JobId = typeof result.job_id === "string" ? result.job_id.trim() : "";
-  if (!result.success || !ai84JobId) {
-    throw new Error(`AI84PRO dubbing rejected: ${JSON.stringify(result)}`);
-  }
-
-  // Defensive guard: avoid polling with malformed IDs like "dubbing:vi"
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ai84JobId)) {
-    throw new Error(`AI84PRO returned invalid job_id: ${ai84JobId}`);
-  }
-
-  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} submitted (job: ${ai84JobId}, cost: ${result.credit_cost} credits)`);
-
-  // Poll for completion
-  const maxWait = 7200000;
-  const start = Date.now();
-  while (Date.now() - start < maxWait) {
-    const statusResp = await ai84proRequest(`/v2/dubbing/${ai84JobId}`, { method: "GET" });
-    if (!statusResp.ok) throw new Error(`AI84PRO poll error ${statusResp.status}`);
-    const statusData = await statusResp.json();
-
-    if (statusData.job?.status === "done") {
-      return statusData.job;
-    }
-    if (statusData.job?.status === "error" || statusData.job?.status === "failed") {
-      throw new Error(`AI84PRO dubbing failed: ${statusData.job.errorMessage || "unknown error"}`);
+      await new Promise(r => setTimeout(r, 3000));
     }
 
-    const elapsed = Math.round((Date.now() - start) / 1000);
-    if (jobId) {
-      updateJob(jobId, "generating_voice", Math.min(88, 70 + Math.floor((Date.now() - start) / maxWait * 18)),
-        `AI84PRO dubbing chunk ${chunkLabel} (${elapsed}s, ${statusData.job?.progress || 0}%)...`);
+    throw new Error("AI84PRO dubbing timeout");
+  };
+
+  const submitAndPoll = async (includeSourceLang) => {
+    console.log(
+      `  🎤 AI84PRO dubbing chunk ${chunkLabel}: file=${filePath} (${fileBuffer.length} bytes), target_lang="${cleanTargetLang}", source_lang="${includeSourceLang ? cleanSourceLang : "<omitted>"}"`
+    );
+
+    const formData = new FormData();
+    formData.append("file", file);
+    formData.append("target_lang", cleanTargetLang);
+    if (includeSourceLang) {
+      formData.append("source_lang", cleanSourceLang);
     }
 
-    await new Promise(r => setTimeout(r, 3000));
+    const resp = await ai84proRequest("/v2/dubbing", {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`AI84PRO dubbing error ${resp.status}: ${errText}`);
+    }
+
+    const result = await resp.json();
+    const ai84JobId = typeof result.job_id === "string" ? result.job_id.trim() : "";
+    if (!result.success || !ai84JobId) {
+      throw new Error(`AI84PRO dubbing rejected: ${JSON.stringify(result)}`);
+    }
+
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ai84JobId)) {
+      throw new Error(`AI84PRO returned invalid job_id: ${ai84JobId}`);
+    }
+
+    console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} submitted (job: ${ai84JobId}, cost: ${result.credit_cost} credits)`);
+    return pollAi84Job(ai84JobId, includeSourceLang);
+  };
+
+  try {
+    return await submitAndPoll(true);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const isInvalidIdWithPrefix = /invalid id/i.test(errMsg) && /dubbing:[a-z]{2}/i.test(errMsg);
+
+    // AI84PRO sometimes returns invalid ID for source_lang values with legacy "dubbing:" prefix.
+    // Retry once without source_lang so the API can auto-detect source language.
+    if (isInvalidIdWithPrefix) {
+      console.warn(`  ⚠️ AI84PRO invalid ID on chunk ${chunkLabel}; retrying without source_lang. Error: ${errMsg}`);
+      return submitAndPoll(false);
+    }
+
+    throw err;
   }
-  throw new Error("AI84PRO dubbing timeout");
 }
 
 async function pollAI33ProTask(taskId, maxWaitMs = 7200000, onProgress = null) {
