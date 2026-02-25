@@ -193,17 +193,16 @@ async function ai84proDubbing(filePath, sourceLang, targetLang, jobId, chunkLabe
     throw new Error("AI84PRO_API_KEY is not configured");
   }
 
-  const { Blob: BlobClass } = require("buffer");
   const fileBuffer = fs.readFileSync(filePath);
-  const blob = new BlobClass([fileBuffer], { type: "audio/mpeg" });
+  const file = new File([fileBuffer], path.basename(filePath), { type: "audio/mpeg" });
 
   const cleanTargetLang = String(targetLang).replace(/^dubbing:/i, "").trim();
   const cleanSourceLang = String(sourceLang === "auto" ? "detect" : sourceLang).replace(/^dubbing:/i, "").trim();
 
   console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel}: file=${filePath} (${fileBuffer.length} bytes), target_lang="${cleanTargetLang}", source_lang="${cleanSourceLang}"`);
 
-  const formData = new globalThis.FormData();
-  formData.append("file", blob, path.basename(filePath));
+  const formData = new FormData();
+  formData.append("file", file);
   formData.append("target_lang", cleanTargetLang);
   formData.append("source_lang", cleanSourceLang);
 
