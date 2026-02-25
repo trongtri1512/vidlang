@@ -119,7 +119,7 @@ app.post("/api/reburn/:jobId", auth, async (req, res) => {
 
   try {
     const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
-    await run(`ffmpeg -y -i "${videoPath}" -i "${ttsAudioPath}" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,BackColour=&H000080FF,BorderStyle=3,Outline=0,Shadow=0,MarginV=25,MarginL=30,MarginR=30,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+    await run(`ffmpeg -y -i "${videoPath}" -i "${ttsAudioPath}" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H000080FF,BackColour=&H80000000,BorderStyle=3,Outline=4,Shadow=0,MarginV=25,MarginL=30,MarginR=30,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
 
     const outputFile = `${jobId}.mp4`;
     fs.copyFileSync(`${workDir}/output.mp4`, path.join(__dirname, "output", outputFile));
@@ -1227,7 +1227,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       // Use absolute path and proper escaping for ffmpeg subtitles filter
       const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
       // Subtitle style: orange background box, white bold text
-      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,BackColour=&H000080FF,BorderStyle=3,Outline=0,Shadow=0,MarginV=25,MarginL=30,MarginR=30,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=22,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H000080FF,BackColour=&H80000000,BorderStyle=3,Outline=4,Shadow=0,MarginV=25,MarginL=30,MarginR=30,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     } else {
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     }
