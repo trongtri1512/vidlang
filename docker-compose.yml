@@ -10,8 +10,9 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./jobs:/app/jobs
-      - ./output:/app/output
+      - /opt/vidlang-data/jobs:/app/jobs
+      - /opt/vidlang-data/output:/app/output
+      - /opt/vidlang-data/uploads:/app/uploads
     env_file:
       - .env
     environment:
