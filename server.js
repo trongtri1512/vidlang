@@ -37,6 +37,21 @@ function auth(req, res, next) {
   next();
 }
 
+function sanitizeDubbingLang(value, { fallback = "en", allowDetect = false } = {}) {
+  const raw = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^dubbing:/i, "");
+
+  if (!raw) return fallback;
+  if (allowDetect && (raw === "auto" || raw === "detect")) return "detect";
+
+  const normalized = raw.split(/[-_]/)[0];
+  if (/^[a-z]{2}$/.test(normalized)) return normalized;
+
+  return fallback;
+}
+
 // ── Routes ──
 
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
@@ -45,8 +60,8 @@ app.post("/api/process", auth, (req, res) => {
   const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate", dubbingConcurrency = 1, dubbingService = "ai33pro" } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
-  const safeTargetLang = typeof targetLang === "string" && targetLang.trim() ? targetLang.trim() : "en";
-  const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
+  const safeTargetLang = sanitizeDubbingLang(targetLang, { fallback: "en" });
+  const safeSourceLang = sanitizeDubbingLang(sourceLang, { fallback: "detect", allowDetect: true });
   const safeConcurrency = Math.max(1, Math.min(10, Number(dubbingConcurrency) || 1));
   const safeDubbingService = ["ai33pro", "ai84pro"].includes(dubbingService) ? dubbingService : "ai33pro";
 
@@ -175,7 +190,8 @@ async function ai33proRequest(endpoint, options) {
 
 async function ai84proRequest(endpoint, options) {
   // Don't override Content-Type when body is FormData (browser/node sets boundary automatically)
-  const isFormData = options.body && typeof options.body.getBoundary === "function" || options.body instanceof globalThis.FormData;
+  const body = options?.body;
+  const isFormData = Boolean(body && (typeof body.getBoundary === "function" || body instanceof FormData));
   const extraHeaders = { ...(options.headers || {}), "xi-api-key": AI84PRO_API_KEY };
   if (isFormData) {
     delete extraHeaders["Content-Type"];
@@ -196,8 +212,8 @@ async function ai84proDubbing(filePath, sourceLang, targetLang, jobId, chunkLabe
   const fileBuffer = fs.readFileSync(filePath);
   const file = new File([fileBuffer], path.basename(filePath), { type: "audio/mpeg" });
 
-  const cleanTargetLang = String(targetLang).replace(/^dubbing:/i, "").trim();
-  const cleanSourceLang = String(sourceLang === "auto" ? "detect" : sourceLang).replace(/^dubbing:/i, "").trim();
+  const cleanTargetLang = sanitizeDubbingLang(targetLang, { fallback: "en" });
+  const cleanSourceLang = sanitizeDubbingLang(sourceLang, { fallback: "detect", allowDetect: true });
 
   console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel}: file=${filePath} (${fileBuffer.length} bytes), target_lang="${cleanTargetLang}", source_lang="${cleanSourceLang}"`);
 
@@ -217,17 +233,23 @@ async function ai84proDubbing(filePath, sourceLang, targetLang, jobId, chunkLabe
   }
 
   const result = await resp.json();
-  if (!result.success || !result.job_id) {
+  const ai84JobId = typeof result.job_id === "string" ? result.job_id.trim() : "";
+  if (!result.success || !ai84JobId) {
     throw new Error(`AI84PRO dubbing rejected: ${JSON.stringify(result)}`);
   }
 
-  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} submitted (job: ${result.job_id}, cost: ${result.credit_cost} credits)`);
+  // Defensive guard: avoid polling with malformed IDs like "dubbing:vi"
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ai84JobId)) {
+    throw new Error(`AI84PRO returned invalid job_id: ${ai84JobId}`);
+  }
+
+  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} submitted (job: ${ai84JobId}, cost: ${result.credit_cost} credits)`);
 
   // Poll for completion
   const maxWait = 7200000;
   const start = Date.now();
   while (Date.now() - start < maxWait) {
-    const statusResp = await ai84proRequest(`/v2/dubbing/${result.job_id}`, { method: "GET" });
+    const statusResp = await ai84proRequest(`/v2/dubbing/${ai84JobId}`, { method: "GET" });
     if (!statusResp.ok) throw new Error(`AI84PRO poll error ${statusResp.status}`);
     const statusData = await statusResp.json();
 
@@ -922,8 +944,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
   fs.mkdirSync(workDir, { recursive: true });
 
   const isYouTube = /(?:youtube\.com|youtu\.be)/i.test(url);
-  const safeTargetLang = typeof targetLang === "string" && targetLang.trim() ? targetLang.trim() : "en";
-  const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
+  const safeTargetLang = sanitizeDubbingLang(targetLang, { fallback: "en" });
+  const safeSourceLang = sanitizeDubbingLang(sourceLang, { fallback: "detect", allowDetect: true });
   const ai33ReceiveUrl =
     (typeof process.env.AI33PRO_RECEIVE_URL === "string" && process.env.AI33PRO_RECEIVE_URL.trim()) ||
     (typeof callbackUrl === "string" && callbackUrl.trim()) ||
