@@ -81,12 +81,13 @@ app.post("/api/upload", auth, upload.single("video"), (req, res) => {
 // ── AI33PRO helpers ──
 
 async function ai33proRequest(endpoint, options) {
+  const headers = {
+    ...(options.headers || {}),
+    "xi-api-key": AI33PRO_API_KEY,
+  };
   const resp = await fetch(`${AI33PRO_BASE_URL}${endpoint}`, {
     ...options,
-    headers: {
-      ...options.headers,
-      "xi-api-key": AI33PRO_API_KEY,
-    },
+    headers,
   });
   return resp;
 }
@@ -901,7 +902,6 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         
         const dubResp = await ai33proRequest("/v1/task/dubbing", {
           method: "POST",
-          headers: {},
           body: dubFormData,
         });
         
