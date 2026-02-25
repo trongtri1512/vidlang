@@ -91,6 +91,54 @@ app.get("/api/jobs", auth, (_req, res) => {
 app.use("/output", express.static(path.join(__dirname, "output")));
 app.use("/uploads", express.static(uploadDir));
 
+// Re-burn subtitles on an existing completed job with updated style
+app.post("/api/reburn/:jobId", auth, async (req, res) => {
+  const { jobId } = req.params;
+  const workDir = path.join(__dirname, "jobs", jobId);
+
+  if (!fs.existsSync(workDir)) {
+    return res.status(400).json({ error: "No job files found for this job." });
+  }
+
+  const videoPath = `${workDir}/video.mp4`;
+  const ttsAudioPath = `${workDir}/tts_audio.mp3`;
+  const srtPath = `${workDir}/subtitles.srt`;
+
+  if (!fs.existsSync(videoPath)) {
+    return res.status(400).json({ error: "video.mp4 not found in job directory." });
+  }
+  if (!fs.existsSync(ttsAudioPath)) {
+    return res.status(400).json({ error: "tts_audio.mp3 not found in job directory." });
+  }
+  if (!fs.existsSync(srtPath)) {
+    return res.status(400).json({ error: "subtitles.srt not found in job directory." });
+  }
+
+  JOBS[jobId] = { ...(JOBS[jobId] || {}), status: "merging", progress: 90, detail: "Re-burning subtitles..." };
+  res.json({ jobId, status: "reburning" });
+
+  try {
+    const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
+    await run(`ffmpeg -y -i "${videoPath}" -i "${ttsAudioPath}" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=24,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H0000D4FF,BackColour=&H80000000,BorderStyle=1,Outline=3,Shadow=2,MarginV=25,MarginL=30,MarginR=30,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+
+    const outputFile = `${jobId}.mp4`;
+    fs.copyFileSync(`${workDir}/output.mp4`, path.join(__dirname, "output", outputFile));
+
+    JOBS[jobId] = {
+      ...(JOBS[jobId] || {}),
+      status: "done",
+      progress: 100,
+      outputUrl: `/output/${outputFile}`,
+      detail: "Subtitles re-burned successfully",
+      completedAt: new Date().toISOString(),
+    };
+    console.log(`[${jobId}] ✅ Subtitles re-burned`);
+  } catch (err) {
+    console.error(`[${jobId}] ❌ Reburn error:`, err.message);
+    JOBS[jobId] = { ...(JOBS[jobId] || {}), status: "error", error: err.message };
+  }
+});
+
 // Upload video file endpoint
 app.post("/api/upload", auth, upload.single("video"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No video file provided" });
@@ -1178,8 +1226,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       updateJob(jobId, "merging", 90, "Merging audio & burning subtitles...");
       // Use absolute path and proper escaping for ffmpeg subtitles filter
       const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
-      // Subtitle style: smaller text, semi-transparent dark background, centered bottom
-      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=14,Bold=1,PrimaryColour=&H00FFFFFF,BackColour=&H80000000,BorderStyle=4,Outline=0,Shadow=0,MarginV=20,MarginL=40,MarginR=40,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
+      // Subtitle style: large text, white with yellow/gold outline border
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='FontName=Noto Sans CJK SC,FontSize=24,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H0000D4FF,BackColour=&H80000000,BorderStyle=1,Outline=3,Shadow=2,MarginV=25,MarginL=30,MarginR=30,Alignment=2'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     } else {
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     }
