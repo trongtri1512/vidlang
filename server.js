@@ -47,10 +47,34 @@ app.post("/api/process", auth, (req, res) => {
   const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
 
   const jobId = uuidv4();
-  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
+  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode };
   res.json({ jobId, status: "accepted" });
 
   processVideo(jobId, youtubeUrl, safeSourceLang, safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode);
+});
+
+// Retry a failed job from where it left off (reuses existing intermediate files)
+// Accepts job params in body since JOBS is in-memory and lost on restart
+app.post("/api/retry/:jobId", auth, (req, res) => {
+  const { jobId } = req.params;
+  const { youtubeUrl, sourceLang = "auto", targetLang = "en", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate" } = req.body || {};
+  
+  const workDir = path.join(__dirname, "jobs", jobId);
+  if (!fs.existsSync(workDir)) {
+    return res.status(400).json({ error: "No intermediate files found. Please start a new job." });
+  }
+  
+  const existingFiles = fs.readdirSync(workDir);
+  const dubbedChunks = existingFiles.filter(f => f.startsWith("dubbed_") && f.endsWith(".mp3"));
+  const hasVideo = existingFiles.includes("video.mp4");
+  const hasTtsAudio = existingFiles.includes("tts_audio.mp3");
+  
+  console.log(`[${jobId}] ♻️ Retry requested. Files: video=${hasVideo}, ttsAudio=${hasTtsAudio}, dubbedChunks=${dubbedChunks.length}`);
+  
+  JOBS[jobId] = { status: "queued", progress: 0, error: null, detail: "Retrying from last checkpoint...", createdAt: new Date().toISOString(), youtubeUrl, sourceLang, targetLang, mode };
+  res.json({ jobId, status: "retrying", cached: { hasVideo, hasTtsAudio, dubbedChunks: dubbedChunks.length } });
+  
+  processVideo(jobId, youtubeUrl || "", sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId, mode);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -776,8 +800,11 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     "https://example.com/ai33pro-webhook";
 
   try {
-    // Download video
-    if (isYouTube) {
+    // Download video (skip if already exists from previous attempt)
+    if (fs.existsSync(`${workDir}/video.mp4`) && fs.statSync(`${workDir}/video.mp4`).size > 10000) {
+      console.log(`[${jobId}] ♻️ Reusing existing video.mp4`);
+      updateJob(jobId, "downloading", 15, "Video already downloaded (cached)");
+    } else if (isYouTube) {
       updateJob(jobId, "downloading", 10, "Downloading YouTube video...");
       await run(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${workDir}/video.mp4" "${url}"`);
     } else {
@@ -859,12 +886,39 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       const rawAudioPath = `${workDir}/dub_input.mp3`;
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${rawAudioPath}"`);
       
-      const audioDuration = await getMediaDuration(rawAudioPath);
-      const audioSize = fs.statSync(rawAudioPath).size;
+      let audioDuration = await getMediaDuration(rawAudioPath);
+      let audioSize = fs.statSync(rawAudioPath).size;
       const MAX_DUB_DURATION = 270; // 4.5 min safety margin
       const MAX_DUB_SIZE = 18 * 1024 * 1024; // 18MB safety margin
       
       console.log(`  📊 Dubbing input: ${audioDuration.toFixed(1)}s, ${(audioSize / 1024 / 1024).toFixed(1)} MB`);
+      
+      // Case 2: Duration < 5min but size > 20MB → compress instead of chunking
+      if (audioDuration <= MAX_DUB_DURATION && audioSize > MAX_DUB_SIZE) {
+        console.log(`  🗜️ Audio under ${MAX_DUB_DURATION}s but ${(audioSize / 1024 / 1024).toFixed(1)}MB > limit. Compressing...`);
+        updateJob(jobId, "generating_voice", 69, "Compressing audio for dubbing...");
+        const compressedPath = `${workDir}/dub_input_compressed.mp3`;
+        // Try 64kbps mono first, if still too big try 48kbps, then 32kbps
+        const bitrates = ["64k", "48k", "32k"];
+        let compressed = false;
+        for (const br of bitrates) {
+          await run(`ffmpeg -y -i "${rawAudioPath}" -acodec libmp3lame -ar 22050 -ac 1 -b:a ${br} "${compressedPath}"`);
+          const compSize = fs.statSync(compressedPath).size;
+          console.log(`    Compressed @${br}: ${(compSize / 1024 / 1024).toFixed(1)} MB`);
+          if (compSize <= MAX_DUB_SIZE) {
+            compressed = true;
+            // Replace raw audio with compressed version
+            fs.copyFileSync(compressedPath, rawAudioPath);
+            audioSize = compSize;
+            break;
+          }
+        }
+        if (!compressed) {
+          console.log(`    ⚠️ Compression insufficient, will chunk anyway`);
+        }
+        // Re-check size after compression
+        audioSize = fs.statSync(rawAudioPath).size;
+      }
       
       // Determine if we need to chunk
       const needsChunking = audioDuration > MAX_DUB_DURATION || audioSize > MAX_DUB_SIZE;
@@ -875,6 +929,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       
       if (needsChunking) {
         console.log(`  ✂️ Audio too large for dubbing, splitting into ${numChunks} chunks (~${chunkDuration}s each)...`);
+      } else if (audioDuration <= MAX_DUB_DURATION) {
+        console.log(`  ✅ Audio fits in single request (${audioDuration.toFixed(1)}s, ${(audioSize / 1024 / 1024).toFixed(1)}MB)`);
       }
       
       const dubbedChunkPaths = [];
@@ -884,6 +940,23 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       for (let ci = 0; ci < numChunks; ci++) {
         const chunkLabel = `${ci + 1}/${numChunks}`;
         const pctBase = 70 + Math.floor((ci / numChunks) * 18);
+        
+        const dubbedPath = `${workDir}/dubbed_${ci}.mp3`;
+        
+        // === RETRY OPTIMIZATION: Skip chunks that already have dubbed output ===
+        if (fs.existsSync(dubbedPath)) {
+          const existingSize = fs.statSync(dubbedPath).size;
+          if (existingSize > 1000) { // Must be at least 1KB to be valid
+            console.log(`  ♻️ Reusing existing dubbed chunk ${chunkLabel} (${(existingSize / 1024).toFixed(0)}KB)`);
+            dubbedChunkPaths.push(dubbedPath);
+            // Still need to get duration for SRT offset
+            const chunkDubbedDuration = await getMediaDuration(dubbedPath);
+            srtTimeOffset += chunkDubbedDuration;
+            updateJob(jobId, "generating_voice", pctBase + 15, `Chunk ${chunkLabel} cached, skipping...`);
+            continue;
+          }
+        }
+        
         updateJob(jobId, "generating_voice", pctBase, `Dubbing chunk ${chunkLabel}...`);
         
         let chunkPath = rawAudioPath;
@@ -942,7 +1015,6 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
           throw new Error(`AI33PRO dubbing chunk ${chunkLabel}: no audio in result`);
         }
         
-        const dubbedPath = `${workDir}/dubbed_${ci}.mp3`;
         const audioResp = await fetch(taskResult.metadata.audio_url);
         const audioArrayBuf = await audioResp.arrayBuffer();
         fs.writeFileSync(dubbedPath, Buffer.from(audioArrayBuf));
@@ -978,14 +1050,16 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         }
       }
       
-      // Merge dubbed audio chunks
+      // Merge dubbed audio chunks (AI33PRO may return AAC, so re-encode to mp3)
       if (dubbedChunkPaths.length === 1) {
-        fs.copyFileSync(dubbedChunkPaths[0], `${workDir}/tts_audio.mp3`);
+        // Single chunk: re-encode to ensure mp3 format
+        await run(`ffmpeg -y -i "${dubbedChunkPaths[0]}" -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${workDir}/tts_audio.mp3"`);
       } else {
         updateJob(jobId, "generating_voice", 89, "Merging dubbed audio chunks...");
         const listFile = `${workDir}/dub_list.txt`;
         fs.writeFileSync(listFile, dubbedChunkPaths.map((f) => `file '${f}'`).join("\n"));
-        await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${workDir}/tts_audio.mp3"`);
+        // Re-encode to mp3 since AI33PRO returns AAC/m4a format
+        await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${workDir}/tts_audio.mp3"`);
         try { fs.unlinkSync(listFile); } catch (_) {}
       }
       
