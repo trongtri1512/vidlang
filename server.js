@@ -40,14 +40,15 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate" } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate", dubbingConcurrency = 1 } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const safeTargetLang = typeof targetLang === "string" && targetLang.trim() ? targetLang.trim() : "en";
   const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
+  const safeConcurrency = Math.max(1, Math.min(6, Number(dubbingConcurrency) || 1));
 
   const jobId = uuidv4();
-  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode };
+  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode, dubbingConcurrency: safeConcurrency };
   res.json({ jobId, status: "accepted" });
 
   processVideo(jobId, youtubeUrl, safeSourceLang, safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode);
@@ -981,11 +982,15 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         console.log(`  ✅ Audio fits in single request (${audioDuration.toFixed(1)}s, ${(audioSize / 1024 / 1024).toFixed(1)}MB)`);
       }
       
-      const dubbedChunkPaths = [];
+      const dubbedChunkPaths = new Array(numChunks).fill(null);
       const dubbedSrtSegments = [];
-      let srtTimeOffset = 0;
       
-      for (let ci = 0; ci < numChunks; ci++) {
+      // Get concurrency from job settings
+      const dubConcurrency = Math.max(1, Math.min(6, JOBS[jobId]?.dubbingConcurrency || 1));
+      console.log(`  🔀 Dubbing concurrency: ${dubConcurrency}`);
+      
+      // Process a single dubbing chunk
+      const processDubChunk = async (ci) => {
         const chunkLabel = `${ci + 1}/${numChunks}`;
         const pctBase = 70 + Math.floor((ci / numChunks) * 18);
         
@@ -994,14 +999,11 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         // === RETRY OPTIMIZATION: Skip chunks that already have dubbed output ===
         if (fs.existsSync(dubbedPath)) {
           const existingSize = fs.statSync(dubbedPath).size;
-          if (existingSize > 1000) { // Must be at least 1KB to be valid
+          if (existingSize > 1000) {
             console.log(`  ♻️ Reusing existing dubbed chunk ${chunkLabel} (${(existingSize / 1024).toFixed(0)}KB)`);
-            dubbedChunkPaths.push(dubbedPath);
-            // Still need to get duration for SRT offset
-            const chunkDubbedDuration = await getMediaDuration(dubbedPath);
-            srtTimeOffset += chunkDubbedDuration;
+            dubbedChunkPaths[ci] = dubbedPath;
             updateJob(jobId, "generating_voice", pctBase + 15, `Chunk ${chunkLabel} cached, skipping...`);
-            continue;
+            return;
           }
         }
         
@@ -1066,53 +1068,71 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         const audioResp = await fetch(taskResult.metadata.audio_url);
         const audioArrayBuf = await audioResp.arrayBuffer();
         fs.writeFileSync(dubbedPath, Buffer.from(audioArrayBuf));
-        dubbedChunkPaths.push(dubbedPath);
+        dubbedChunkPaths[ci] = dubbedPath;
         console.log(`  ✅ Dubbing chunk ${chunkLabel} done`);
         
-        // Download SRT if available (for subtitles)
+        // Download SRT if available (for subtitles) — stored with index for ordering later
         if (enableSubtitles && taskResult.metadata?.srt_url) {
           try {
             const srtResp = await fetch(taskResult.metadata.srt_url);
             const srtText = await srtResp.text();
             const chunkSegments = parseSrtToSegments(srtText);
-            // Offset timestamps for chunked audio
-            for (const seg of chunkSegments) {
-              dubbedSrtSegments.push({
-                start: seg.start + srtTimeOffset,
-                end: seg.end + srtTimeOffset,
-                text: seg.text,
-              });
-            }
+            dubbedSrtSegments.push({ ci, segments: chunkSegments });
           } catch (_e) {
             console.log(`  ⚠️ Could not download SRT for chunk ${chunkLabel}`);
           }
         }
         
-        // Track time offset for next chunk's SRT
-        const chunkDubbedDuration = await getMediaDuration(dubbedPath);
-        srtTimeOffset += chunkDubbedDuration;
-        
         // Cleanup chunk input
         if (needsChunking) {
           try { fs.unlinkSync(chunkPath); } catch (_) {}
         }
+      };
+      
+      // Process chunks in batches of dubConcurrency
+      for (let batchStart = 0; batchStart < numChunks; batchStart += dubConcurrency) {
+        const batchEnd = Math.min(batchStart + dubConcurrency, numChunks);
+        const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
+        updateJob(jobId, "generating_voice", 70 + Math.floor((batchStart / numChunks) * 18),
+          `Dubbing chunks ${batchStart + 1}-${batchEnd}/${numChunks} (×${batchIndices.length})...`);
+        await Promise.all(batchIndices.map(i => processDubChunk(i)));
       }
       
+      // Rebuild SRT with correct time offsets (sequential order)
+      if (enableSubtitles && dubbedSrtSegments.length > 0) {
+        dubbedSrtSegments.sort((a, b) => a.ci - b.ci);
+        let srtTimeOffset = 0;
+        const finalSrtSegments = [];
+        for (const { ci, segments } of dubbedSrtSegments) {
+          const chunkDubbedDuration = await getMediaDuration(dubbedChunkPaths[ci]);
+          for (const seg of segments) {
+            finalSrtSegments.push({ start: seg.start + srtTimeOffset, end: seg.end + srtTimeOffset, text: seg.text });
+          }
+          srtTimeOffset += chunkDubbedDuration;
+        }
+        // Replace dubbedSrtSegments content for downstream use
+        dubbedSrtSegments.length = 0;
+        dubbedSrtSegments.push(...finalSrtSegments);
+      }
+      
+      // Filter out any null entries (shouldn't happen but safety)
+      const validChunkPaths = dubbedChunkPaths.filter(Boolean);
+      
       // Merge dubbed audio chunks (AI33PRO may return AAC, so re-encode to mp3)
-      if (dubbedChunkPaths.length === 1) {
+      if (validChunkPaths.length === 1) {
         // Single chunk: re-encode to ensure mp3 format
-        await run(`ffmpeg -y -i "${dubbedChunkPaths[0]}" -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${workDir}/tts_audio.mp3"`);
+        await run(`ffmpeg -y -i "${validChunkPaths[0]}" -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${workDir}/tts_audio.mp3"`);
       } else {
         updateJob(jobId, "generating_voice", 89, "Merging dubbed audio chunks...");
         const listFile = `${workDir}/dub_list.txt`;
-        fs.writeFileSync(listFile, dubbedChunkPaths.map((f) => `file '${f}'`).join("\n"));
+        fs.writeFileSync(listFile, validChunkPaths.map((f) => `file '${f}'`).join("\n"));
         // Re-encode to mp3 since AI33PRO returns AAC/m4a format
         await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${workDir}/tts_audio.mp3"`);
         try { fs.unlinkSync(listFile); } catch (_) {}
       }
       
       // Cleanup dubbed chunk files
-      dubbedChunkPaths.forEach((f) => { try { fs.unlinkSync(f); } catch (_) {} });
+      validChunkPaths.forEach((f) => { try { fs.unlinkSync(f); } catch (_) {} });
       try { fs.unlinkSync(rawAudioPath); } catch (_) {}
       
       console.log(`  ✅ AI33PRO dubbing complete (${numChunks} chunks)`);
