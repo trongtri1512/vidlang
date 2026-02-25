@@ -43,11 +43,14 @@ app.post("/api/process", auth, (req, res) => {
   const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate" } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
+  const safeTargetLang = typeof targetLang === "string" && targetLang.trim() ? targetLang.trim() : "en";
+  const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
+
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId, mode);
+  processVideo(jobId, youtubeUrl, safeSourceLang, safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -765,6 +768,12 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
   fs.mkdirSync(workDir, { recursive: true });
 
   const isYouTube = /(?:youtube\.com|youtu\.be)/i.test(url);
+  const safeTargetLang = typeof targetLang === "string" && targetLang.trim() ? targetLang.trim() : "en";
+  const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
+  const ai33ReceiveUrl =
+    (typeof process.env.AI33PRO_RECEIVE_URL === "string" && process.env.AI33PRO_RECEIVE_URL.trim()) ||
+    (typeof callbackUrl === "string" && callbackUrl.trim()) ||
+    "https://example.com/ai33pro-webhook";
 
   try {
     // Download video
@@ -897,8 +906,9 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         dubFormData.append("file", chunkBlob, "audio.mp3");
         dubFormData.append("num_speakers", "0");
         dubFormData.append("disable_voice_cloning", "false");
-        dubFormData.append("source_lang", sourceLang === "auto" ? "auto" : sourceLang);
-        dubFormData.append("target_lang", targetLang);
+        dubFormData.append("source_lang", safeSourceLang === "auto" ? "auto" : safeSourceLang);
+        dubFormData.append("target_lang", String(safeTargetLang));
+        dubFormData.append("receive_url", String(ai33ReceiveUrl));
         
         const dubResp = await ai33proRequest("/v1/task/dubbing", {
           method: "POST",
