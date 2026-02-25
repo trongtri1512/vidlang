@@ -174,13 +174,16 @@ async function ai33proRequest(endpoint, options) {
 // ── AI84PRO helpers ──
 
 async function ai84proRequest(endpoint, options) {
-  const headers = {
-    ...(options.headers || {}),
-    "xi-api-key": AI84PRO_API_KEY,
-  };
+  // Don't override Content-Type when body is FormData (browser/node sets boundary automatically)
+  const isFormData = options.body && typeof options.body.getBoundary === "function" || options.body instanceof globalThis.FormData;
+  const extraHeaders = { ...(options.headers || {}), "xi-api-key": AI84PRO_API_KEY };
+  if (isFormData) {
+    delete extraHeaders["Content-Type"];
+    delete extraHeaders["content-type"];
+  }
   const resp = await fetch(`${AI84PRO_BASE_URL}${endpoint}`, {
     ...options,
-    headers,
+    headers: extraHeaders,
   });
   return resp;
 }
@@ -192,14 +195,17 @@ async function ai84proDubbing(filePath, sourceLang, targetLang, jobId, chunkLabe
 
   const { Blob: BlobClass } = require("buffer");
   const fileBuffer = fs.readFileSync(filePath);
-  const blob = new BlobClass([fileBuffer], { type: "audio/mp3" });
+  const blob = new BlobClass([fileBuffer], { type: "audio/mpeg" });
+
+  const cleanTargetLang = String(targetLang).replace(/^dubbing:/i, "").trim();
+  const cleanSourceLang = String(sourceLang === "auto" ? "detect" : sourceLang).replace(/^dubbing:/i, "").trim();
+
+  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel}: file=${filePath} (${fileBuffer.length} bytes), target_lang="${cleanTargetLang}", source_lang="${cleanSourceLang}"`);
 
   const formData = new globalThis.FormData();
-  formData.append("file", blob, "audio.mp3");
-  formData.append("target_lang", targetLang);
-  formData.append("source_lang", sourceLang === "auto" ? "detect" : sourceLang);
-
-  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} uploading...`);
+  formData.append("file", blob, path.basename(filePath));
+  formData.append("target_lang", cleanTargetLang);
+  formData.append("source_lang", cleanSourceLang);
 
   const resp = await ai84proRequest("/v2/dubbing", {
     method: "POST",
