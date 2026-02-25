@@ -21,6 +21,8 @@ const upload = multer({
 const API_SECRET = process.env.API_SECRET || "change-me";
 const AI33PRO_API_KEY = process.env.AI33PRO_API_KEY || "";
 const AI33PRO_BASE_URL = "https://api.ai33.pro";
+const AI84PRO_API_KEY = process.env.AI84PRO_API_KEY || "";
+const AI84PRO_BASE_URL = "https://api.ai84.pro";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 const GOOGLE_TRANSLATE_API_KEY = process.env.GOOGLE_TRANSLATE_API_KEY || "";
 const GOOGLE_TTS_API_KEY = process.env.GOOGLE_TTS_API_KEY || GOOGLE_TRANSLATE_API_KEY; // Can reuse same Google Cloud API key
@@ -40,15 +42,16 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate", dubbingConcurrency = 1 } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate", dubbingConcurrency = 1, dubbingService = "ai33pro" } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const safeTargetLang = typeof targetLang === "string" && targetLang.trim() ? targetLang.trim() : "en";
   const safeSourceLang = typeof sourceLang === "string" && sourceLang.trim() ? sourceLang.trim() : "auto";
-  const safeConcurrency = Math.max(1, Math.min(6, Number(dubbingConcurrency) || 1));
+  const safeConcurrency = Math.max(1, Math.min(10, Number(dubbingConcurrency) || 1));
+  const safeDubbingService = ["ai33pro", "ai84pro"].includes(dubbingService) ? dubbingService : "ai33pro";
 
   const jobId = uuidv4();
-  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode, dubbingConcurrency: safeConcurrency };
+  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode, dubbingConcurrency: safeConcurrency, dubbingService: safeDubbingService };
   res.json({ jobId, status: "accepted" });
 
   processVideo(jobId, youtubeUrl, safeSourceLang, safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode);
@@ -166,6 +169,79 @@ async function ai33proRequest(endpoint, options) {
     headers,
   });
   return resp;
+}
+
+// ── AI84PRO helpers ──
+
+async function ai84proRequest(endpoint, options) {
+  const headers = {
+    ...(options.headers || {}),
+    "xi-api-key": AI84PRO_API_KEY,
+  };
+  const resp = await fetch(`${AI84PRO_BASE_URL}${endpoint}`, {
+    ...options,
+    headers,
+  });
+  return resp;
+}
+
+async function ai84proDubbing(filePath, sourceLang, targetLang, jobId, chunkLabel) {
+  if (!AI84PRO_API_KEY) {
+    throw new Error("AI84PRO_API_KEY is not configured");
+  }
+
+  const { Blob: BlobClass } = require("buffer");
+  const fileBuffer = fs.readFileSync(filePath);
+  const blob = new BlobClass([fileBuffer], { type: "audio/mp3" });
+
+  const formData = new globalThis.FormData();
+  formData.append("file", blob, "audio.mp3");
+  formData.append("target_lang", targetLang);
+  formData.append("source_lang", sourceLang === "auto" ? "detect" : sourceLang);
+
+  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} uploading...`);
+
+  const resp = await ai84proRequest("/v2/dubbing", {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`AI84PRO dubbing error ${resp.status}: ${errText}`);
+  }
+
+  const result = await resp.json();
+  if (!result.success || !result.job_id) {
+    throw new Error(`AI84PRO dubbing rejected: ${JSON.stringify(result)}`);
+  }
+
+  console.log(`  🎤 AI84PRO dubbing chunk ${chunkLabel} submitted (job: ${result.job_id}, cost: ${result.credit_cost} credits)`);
+
+  // Poll for completion
+  const maxWait = 7200000;
+  const start = Date.now();
+  while (Date.now() - start < maxWait) {
+    const statusResp = await ai84proRequest(`/v2/dubbing/${result.job_id}`, { method: "GET" });
+    if (!statusResp.ok) throw new Error(`AI84PRO poll error ${statusResp.status}`);
+    const statusData = await statusResp.json();
+
+    if (statusData.job?.status === "done") {
+      return statusData.job;
+    }
+    if (statusData.job?.status === "error" || statusData.job?.status === "failed") {
+      throw new Error(`AI84PRO dubbing failed: ${statusData.job.errorMessage || "unknown error"}`);
+    }
+
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    if (jobId) {
+      updateJob(jobId, "generating_voice", Math.min(88, 70 + Math.floor((Date.now() - start) / maxWait * 18)),
+        `AI84PRO dubbing chunk ${chunkLabel} (${elapsed}s, ${statusData.job?.progress || 0}%)...`);
+    }
+
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  throw new Error("AI84PRO dubbing timeout");
 }
 
 async function pollAI33ProTask(taskId, maxWaitMs = 7200000, onProgress = null) {
@@ -986,8 +1062,9 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       const dubbedSrtSegments = [];
       
       // Get concurrency from job settings
-      const dubConcurrency = Math.max(1, Math.min(6, JOBS[jobId]?.dubbingConcurrency || 1));
-      console.log(`  🔀 Dubbing concurrency: ${dubConcurrency}`);
+      const dubConcurrency = Math.max(1, Math.min(10, JOBS[jobId]?.dubbingConcurrency || 1));
+      const dubbingServiceName = JOBS[jobId]?.dubbingService || "ai33pro";
+      console.log(`  🔀 Dubbing concurrency: ${dubConcurrency}, service: ${dubbingServiceName}`);
       
       // Process a single dubbing chunk
       const processDubChunk = async (ci) => {
@@ -1020,66 +1097,82 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
           }
         }
         
-        // Upload chunk to AI33PRO dubbing
-        const { Blob: BlobClass } = require("buffer");
-        const chunkBuffer = fs.readFileSync(chunkPath);
-        const chunkBlob = new BlobClass([chunkBuffer], { type: "audio/mp3" });
-        
-        const dubFormData = new globalThis.FormData();
-        dubFormData.append("file", chunkBlob, "audio.mp3");
-        dubFormData.append("num_speakers", "0");
-        dubFormData.append("disable_voice_cloning", "false");
-        dubFormData.append("source_lang", safeSourceLang === "auto" ? "auto" : safeSourceLang);
-        dubFormData.append("target_lang", String(safeTargetLang));
-        dubFormData.append("receive_url", String(ai33ReceiveUrl));
-        
-        const dubResp = await ai33proRequest("/v1/task/dubbing", {
-          method: "POST",
-          body: dubFormData,
-        });
-        
-        if (!dubResp.ok) {
-          const errText = await dubResp.text();
-          throw new Error(`AI33PRO dubbing error ${dubResp.status}: ${errText}`);
-        }
-        
-        const dubResult = await dubResp.json();
-        if (!dubResult.success || !dubResult.task_id) {
-          throw new Error(`AI33PRO dubbing rejected: ${JSON.stringify(dubResult)}`);
-        }
-        
-        if (dubResult.ec_remain_credits !== undefined && dubResult.ec_remain_credits <= 0) {
-          throw new Error("AI33PRO out of credits");
-        }
-        
-        console.log(`  🎤 Dubbing chunk ${chunkLabel} submitted (task: ${dubResult.task_id})`);
-        
-        // Poll for result
-        const taskResult = await pollAI33ProTask(dubResult.task_id, 7200000, (elapsed) => {
-          const secs = Math.round(elapsed / 1000);
-          updateJob(jobId, "generating_voice", Math.min(pctBase + 15, 88), `Dubbing chunk ${chunkLabel} (${secs}s)...`);
-        });
-        
-        // Download dubbed audio
-        if (!taskResult.metadata?.audio_url) {
-          throw new Error(`AI33PRO dubbing chunk ${chunkLabel}: no audio in result`);
-        }
-        
-        const audioResp = await fetch(taskResult.metadata.audio_url);
-        const audioArrayBuf = await audioResp.arrayBuffer();
-        fs.writeFileSync(dubbedPath, Buffer.from(audioArrayBuf));
-        dubbedChunkPaths[ci] = dubbedPath;
-        console.log(`  ✅ Dubbing chunk ${chunkLabel} done`);
-        
-        // Download SRT if available (for subtitles) — stored with index for ordering later
-        if (enableSubtitles && taskResult.metadata?.srt_url) {
-          try {
-            const srtResp = await fetch(taskResult.metadata.srt_url);
-            const srtText = await srtResp.text();
-            const chunkSegments = parseSrtToSegments(srtText);
-            dubbedSrtSegments.push({ ci, segments: chunkSegments });
-          } catch (_e) {
-            console.log(`  ⚠️ Could not download SRT for chunk ${chunkLabel}`);
+        if (dubbingServiceName === "ai84pro") {
+          // === AI84PRO dubbing ===
+          const dubResult = await ai84proDubbing(chunkPath, safeSourceLang, safeTargetLang, jobId, chunkLabel);
+          
+          // Download dubbed audio
+          if (!dubResult.outputFileUrl) {
+            throw new Error(`AI84PRO dubbing chunk ${chunkLabel}: no output URL in result`);
+          }
+          
+          const audioResp = await fetch(dubResult.outputFileUrl);
+          const audioArrayBuf = await audioResp.arrayBuffer();
+          fs.writeFileSync(dubbedPath, Buffer.from(audioArrayBuf));
+          dubbedChunkPaths[ci] = dubbedPath;
+          console.log(`  ✅ AI84PRO dubbing chunk ${chunkLabel} done`);
+        } else {
+          // === AI33PRO dubbing (default) ===
+          const { Blob: BlobClass } = require("buffer");
+          const chunkBuffer = fs.readFileSync(chunkPath);
+          const chunkBlob = new BlobClass([chunkBuffer], { type: "audio/mp3" });
+          
+          const dubFormData = new globalThis.FormData();
+          dubFormData.append("file", chunkBlob, "audio.mp3");
+          dubFormData.append("num_speakers", "0");
+          dubFormData.append("disable_voice_cloning", "false");
+          dubFormData.append("source_lang", safeSourceLang === "auto" ? "auto" : safeSourceLang);
+          dubFormData.append("target_lang", String(safeTargetLang));
+          dubFormData.append("receive_url", String(ai33ReceiveUrl));
+          
+          const dubResp = await ai33proRequest("/v1/task/dubbing", {
+            method: "POST",
+            body: dubFormData,
+          });
+          
+          if (!dubResp.ok) {
+            const errText = await dubResp.text();
+            throw new Error(`AI33PRO dubbing error ${dubResp.status}: ${errText}`);
+          }
+          
+          const dubResult = await dubResp.json();
+          if (!dubResult.success || !dubResult.task_id) {
+            throw new Error(`AI33PRO dubbing rejected: ${JSON.stringify(dubResult)}`);
+          }
+          
+          if (dubResult.ec_remain_credits !== undefined && dubResult.ec_remain_credits <= 0) {
+            throw new Error("AI33PRO out of credits");
+          }
+          
+          console.log(`  🎤 Dubbing chunk ${chunkLabel} submitted (task: ${dubResult.task_id})`);
+          
+          // Poll for result
+          const taskResult = await pollAI33ProTask(dubResult.task_id, 7200000, (elapsed) => {
+            const secs = Math.round(elapsed / 1000);
+            updateJob(jobId, "generating_voice", Math.min(pctBase + 15, 88), `Dubbing chunk ${chunkLabel} (${secs}s)...`);
+          });
+          
+          // Download dubbed audio
+          if (!taskResult.metadata?.audio_url) {
+            throw new Error(`AI33PRO dubbing chunk ${chunkLabel}: no audio in result`);
+          }
+          
+          const audioResp = await fetch(taskResult.metadata.audio_url);
+          const audioArrayBuf = await audioResp.arrayBuffer();
+          fs.writeFileSync(dubbedPath, Buffer.from(audioArrayBuf));
+          dubbedChunkPaths[ci] = dubbedPath;
+          console.log(`  ✅ AI33PRO dubbing chunk ${chunkLabel} done`);
+          
+          // Download SRT if available (for subtitles) — stored with index for ordering later
+          if (enableSubtitles && taskResult.metadata?.srt_url) {
+            try {
+              const srtResp = await fetch(taskResult.metadata.srt_url);
+              const srtText = await srtResp.text();
+              const chunkSegments = parseSrtToSegments(srtText);
+              dubbedSrtSegments.push({ ci, segments: chunkSegments });
+            } catch (_e) {
+              console.log(`  ⚠️ Could not download SRT for chunk ${chunkLabel}`);
+            }
           }
         }
         
@@ -1354,5 +1447,6 @@ function run(cmd) {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 VidLang API running on port ${PORT}`);
-  console.log(`   AI33PRO: ${AI33PRO_API_KEY ? "✅ configured" : "❌ NOT SET - required!"}`);
+  console.log(`   AI33PRO: ${AI33PRO_API_KEY ? "✅ configured" : "❌ NOT SET"}`);
+  console.log(`   AI84PRO: ${AI84PRO_API_KEY ? "✅ configured" : "❌ NOT SET"}`);
 });
