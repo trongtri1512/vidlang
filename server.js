@@ -40,14 +40,14 @@ function auth(req, res, next) {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate" } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const jobId = uuidv4();
   JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString() };
   res.json({ jobId, status: "accepted" });
 
-  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId);
+  processVideo(jobId, youtubeUrl, sourceLang, targetLang, callbackUrl, enableSubtitles, voiceId, mode);
 });
 
 app.get("/api/status/:jobId", auth, (req, res) => {
@@ -116,20 +116,14 @@ async function pollAI33ProTask(taskId, maxWaitMs = 7200000, onProgress = null) {
 
 // ── STT: AI33PRO only ──
 
-async function transcribeAudio(filePath, jobId = null) {
-  if (!AI33PRO_API_KEY) {
-    throw new Error("AI33PRO_API_KEY is not configured");
-  }
-
-  console.log("  📝 Transcribing with AI33PRO STT...");
-  if (jobId) updateJob(jobId, "transcribing", 32, "Reading audio file...");
-
+// Transcribe a single audio chunk with AI33PRO (must be <20MB and <5min)
+async function transcribeAudioChunk(filePath, jobId = null, chunkLabel = "") {
   const { Blob } = require("buffer");
   const fileBuffer = fs.readFileSync(filePath);
   const fileSizeMB = (fileBuffer.length / (1024 * 1024)).toFixed(1);
   const blob = new Blob([fileBuffer], { type: "audio/wav" });
 
-  if (jobId) updateJob(jobId, "transcribing", 35, `Uploading audio (${fileSizeMB} MB)...`);
+  console.log(`  📝 STT chunk ${chunkLabel} (${fileSizeMB} MB)...`);
 
   const formData = new globalThis.FormData();
   formData.append("file", blob, "audio.wav");
@@ -155,49 +149,123 @@ async function transcribeAudio(filePath, jobId = null) {
     throw new Error("AI33PRO out of credits");
   }
 
-  if (jobId) updateJob(jobId, "transcribing", 40, "Waiting for speech recognition...");
+  const taskResult = await pollAI33ProTask(result.task_id, 7200000);
 
-  const taskResult = await pollAI33ProTask(result.task_id, 7200000, (elapsed) => {
-    if (jobId) {
-      const secs = Math.round(elapsed / 1000);
-      updateJob(jobId, "transcribing", Math.min(45, 40 + Math.floor(secs / 6)), `Processing speech recognition (${secs}s)...`);
-    }
-  });
-
-  if (jobId) updateJob(jobId, "transcribing", 48, "Downloading transcript...");
-
-  // Try to get segmented data (with timestamps) for subtitles
   if (taskResult.metadata?.json_url) {
     const jsonResp = await fetch(taskResult.metadata.json_url);
     const jsonData = await jsonResp.json();
-    console.log("  ✅ AI33PRO STT success");
-    if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
     const rawSegments = jsonData.segments || jsonData.chunks || null;
     const fullText = jsonData.text || extractTextFromJson(jsonData);
-    // If no segments from API, generate them from text (split by sentences)
     const segments = rawSegments && rawSegments.length > 0
       ? rawSegments
       : generateSegmentsFromText(fullText);
-    return {
-      text: fullText,
-      language: jsonData.language || "auto",
-      segments,
-    };
+    return { text: fullText, language: jsonData.language || "auto", segments };
   }
 
   if (taskResult.metadata?.srt_url) {
     const srtResp = await fetch(taskResult.metadata.srt_url);
     const srtText = await srtResp.text();
-    console.log("  ✅ AI33PRO STT success (SRT)");
-    if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
-    return {
-      text: parseSrtToText(srtText),
-      language: "auto",
-      segments: parseSrtToSegments(srtText),
-    };
+    return { text: parseSrtToText(srtText), language: "auto", segments: parseSrtToSegments(srtText) };
   }
 
   throw new Error("AI33PRO STT: no transcript in result");
+}
+
+async function transcribeAudio(filePath, jobId = null) {
+  if (!AI33PRO_API_KEY) {
+    throw new Error("AI33PRO_API_KEY is not configured");
+  }
+
+  console.log("  📝 Transcribing with AI33PRO STT...");
+  if (jobId) updateJob(jobId, "transcribing", 32, "Checking audio duration...");
+
+  // Check audio duration and file size
+  const audioDuration = await getMediaDuration(filePath);
+  const fileSize = fs.statSync(filePath).size;
+  const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(1);
+  const MAX_DURATION = 270; // 4.5 minutes (safety margin under 5min limit)
+  const MAX_SIZE = 18 * 1024 * 1024; // 18MB (safety margin under 20MB limit)
+
+  console.log(`  📊 Audio: ${audioDuration.toFixed(1)}s, ${fileSizeMB} MB`);
+
+  // If audio is small enough, transcribe directly
+  if (audioDuration <= MAX_DURATION && fileSize <= MAX_SIZE) {
+    if (jobId) updateJob(jobId, "transcribing", 35, `Uploading audio (${fileSizeMB} MB)...`);
+    const result = await transcribeAudioChunk(filePath, jobId, "1/1");
+    console.log("  ✅ AI33PRO STT success");
+    if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
+    return result;
+  }
+
+  // Audio exceeds limits — split into chunks
+  const numChunks = Math.max(
+    Math.ceil(audioDuration / MAX_DURATION),
+    Math.ceil(fileSize / MAX_SIZE)
+  );
+  const chunkDuration = Math.floor(audioDuration / numChunks);
+  console.log(`  ✂️ Audio too large, splitting into ${numChunks} chunks (~${chunkDuration}s each)...`);
+  if (jobId) updateJob(jobId, "transcribing", 33, `Splitting audio into ${numChunks} chunks...`);
+
+  const workDir = path.dirname(filePath);
+  const chunkFiles = [];
+
+  // Split audio using ffmpeg
+  for (let i = 0; i < numChunks; i++) {
+    const startSec = i * chunkDuration;
+    const chunkPath = path.join(workDir, `audio_chunk_${i}.wav`);
+    // Last chunk: no duration limit (take remainder)
+    if (i === numChunks - 1) {
+      await run(`ffmpeg -y -i "${filePath}" -ss ${startSec} -acodec pcm_s16le -ar 16000 -ac 1 "${chunkPath}"`);
+    } else {
+      await run(`ffmpeg -y -i "${filePath}" -ss ${startSec} -t ${chunkDuration} -acodec pcm_s16le -ar 16000 -ac 1 "${chunkPath}"`);
+    }
+    chunkFiles.push(chunkPath);
+  }
+
+  // Transcribe each chunk sequentially (to preserve order and manage credits)
+  const allSegments = [];
+  let fullText = "";
+  let detectedLang = "auto";
+  let timeOffset = 0;
+
+  for (let i = 0; i < chunkFiles.length; i++) {
+    if (jobId) {
+      const pct = 35 + Math.floor((i / chunkFiles.length) * 13);
+      updateJob(jobId, "transcribing", pct, `Transcribing chunk ${i + 1}/${chunkFiles.length}...`);
+    }
+
+    const chunkResult = await transcribeAudioChunk(chunkFiles[i], null, `${i + 1}/${chunkFiles.length}`);
+
+    if (chunkResult.language && chunkResult.language !== "auto") {
+      detectedLang = chunkResult.language;
+    }
+
+    fullText += (fullText ? " " : "") + chunkResult.text;
+
+    // Offset segment timestamps by the chunk's start time
+    const chunkStartTime = i * chunkDuration;
+    if (chunkResult.segments) {
+      for (const seg of chunkResult.segments) {
+        allSegments.push({
+          start: seg.start + chunkStartTime,
+          end: seg.end + chunkStartTime,
+          text: seg.text,
+        });
+      }
+    }
+
+    // Cleanup chunk file
+    try { fs.unlinkSync(chunkFiles[i]); } catch (_) {}
+  }
+
+  console.log(`  ✅ AI33PRO STT success (${chunkFiles.length} chunks merged, ${allSegments.length} segments)`);
+  if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
+
+  return {
+    text: fullText,
+    language: detectedLang,
+    segments: allSegments,
+  };
 }
 
 function extractTextFromJson(data) {
@@ -691,80 +759,244 @@ function parseYouTubeSubFile(workDir, sourceLang) {
 
 // ── Processing pipeline ──
 
-async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false, customVoiceId = null) {
+async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, enableSubtitles = false, customVoiceId = null, mode = "translate") {
   const workDir = path.join(__dirname, "jobs", jobId);
   fs.mkdirSync(workDir, { recursive: true });
 
   const isYouTube = /(?:youtube\.com|youtu\.be)/i.test(url);
 
   try {
+    // Download video
     if (isYouTube) {
-      updateJob(jobId, "downloading", 5, "Checking YouTube subtitles...");
-
-      // Step 1: Try to get YouTube subtitles first (fast, free, accurate)
-      const ytSubs = await tryYouTubeSubtitles(workDir, url, sourceLang);
-
       updateJob(jobId, "downloading", 10, "Downloading YouTube video...");
       await run(`yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 -o "${workDir}/video.mp4" "${url}"`);
-
-      var transcript;
-      if (ytSubs) {
-        updateJob(jobId, "transcribing", 30, "Using YouTube subtitles (fast mode)");
-        transcript = ytSubs;
-        console.log(`  ⚡ Skipping STT - using YouTube subtitles (${ytSubs.segments.length} segments)`);
-      }
     } else {
-      // Direct video URL: download with curl
       updateJob(jobId, "downloading", 5, "Downloading video from URL...");
       await run(`curl -L -o "${workDir}/video.mp4" --max-filesize 2147483648 --connect-timeout 30 --max-time 3600 "${url}"`);
       updateJob(jobId, "downloading", 15, "Video downloaded");
-      var transcript;
     }
 
-    if (!transcript) {
-      // Fallback: extract audio and use STT (for direct URLs or YouTube without subs)
-      updateJob(jobId, "extracting_audio", 20);
-      await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
+    var transcript = null;
 
-      updateJob(jobId, "transcribing", 30, "Uploading audio to STT service...");
-      transcript = await transcribeAudio(`${workDir}/audio.wav`, jobId);
-    }
-    fs.writeFileSync(`${workDir}/transcript.json`, JSON.stringify(transcript, null, 2));
-
-    updateJob(jobId, "translating", 50);
-    let translatedText;
-
-    // If subtitles enabled and we have segments, translate per segment
-    let srtPath = null;
-    if (enableSubtitles && transcript.segments && transcript.segments.length > 0) {
-      updateJob(jobId, "translating", 52, "Translating segments for subtitles...");
-      const translatedSegments = [];
-      for (let i = 0; i < transcript.segments.length; i++) {
-        const seg = transcript.segments[i];
-        const translated = await translateText(seg.text, sourceLang, targetLang);
-        translatedSegments.push({ ...seg, text: translated });
-        if (i % 5 === 0) {
-          updateJob(jobId, "translating", 52 + Math.floor((i / transcript.segments.length) * 15), `Translating segment ${i + 1}/${transcript.segments.length}...`);
+    // In dubbing mode, AI33PRO handles STT + translation + voice internally
+    // We only need transcript for translate mode
+    if (mode !== "dubbing") {
+      if (isYouTube) {
+        updateJob(jobId, "downloading", 5, "Checking YouTube subtitles...");
+        const ytSubs = await tryYouTubeSubtitles(workDir, url, sourceLang);
+        if (ytSubs) {
+          updateJob(jobId, "transcribing", 30, "Using YouTube subtitles (fast mode)");
+          transcript = ytSubs;
+          console.log(`  ⚡ Skipping STT - using YouTube subtitles (${ytSubs.segments.length} segments)`);
         }
       }
-      translatedText = translatedSegments.map((s) => s.text).join(" ");
 
-      // Generate SRT file
-      srtPath = `${workDir}/subtitles.srt`;
-      let srtContent = "";
-      for (let i = 0; i < translatedSegments.length; i++) {
-        const seg = translatedSegments[i];
-        srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+      if (!transcript) {
+        updateJob(jobId, "extracting_audio", 20);
+        await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
+        updateJob(jobId, "transcribing", 30, "Uploading audio to STT service...");
+        transcript = await transcribeAudio(`${workDir}/audio.wav`, jobId);
       }
-      fs.writeFileSync(srtPath, srtContent, "utf-8");
-      console.log(`  📄 Generated SRT with ${translatedSegments.length} segments`);
-    } else {
-      translatedText = await translateText(transcript.text, sourceLang, targetLang);
+      fs.writeFileSync(`${workDir}/transcript.json`, JSON.stringify(transcript, null, 2));
     }
-    fs.writeFileSync(`${workDir}/translated.txt`, translatedText);
 
     // ── TTS Generation ──
-    if (enableSubtitles && srtPath && transcript.segments && transcript.segments.length > 0) {
+    const isDubbing = mode === "dubbing";
+    let translatedText;
+    let srtPath = null;
+
+    if (isDubbing) {
+      // Dubbing mode: AI33PRO handles translation + voice cloning internally
+      // Skip separate translate + TTS steps
+      updateJob(jobId, "translating", 55, "Dubbing mode — AI33PRO handles translation & voice...");
+    } else {
+      // Translate mode: manual translate + Google TTS
+      updateJob(jobId, "translating", 50);
+
+      if (enableSubtitles && transcript.segments && transcript.segments.length > 0) {
+        updateJob(jobId, "translating", 52, "Translating segments for subtitles...");
+        const translatedSegments = [];
+        for (let i = 0; i < transcript.segments.length; i++) {
+          const seg = transcript.segments[i];
+          const translated = await translateText(seg.text, sourceLang, targetLang);
+          translatedSegments.push({ ...seg, text: translated });
+          if (i % 5 === 0) {
+            updateJob(jobId, "translating", 52 + Math.floor((i / transcript.segments.length) * 15), `Translating segment ${i + 1}/${transcript.segments.length}...`);
+          }
+        }
+        translatedText = translatedSegments.map((s) => s.text).join(" ");
+
+        srtPath = `${workDir}/subtitles.srt`;
+        let srtContent = "";
+        for (let i = 0; i < translatedSegments.length; i++) {
+          const seg = translatedSegments[i];
+          srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+        }
+        fs.writeFileSync(srtPath, srtContent, "utf-8");
+        console.log(`  📄 Generated SRT with ${translatedSegments.length} segments`);
+      } else {
+        translatedText = await translateText(transcript.text, sourceLang, targetLang);
+      }
+      fs.writeFileSync(`${workDir}/translated.txt`, translatedText || "");
+    }
+    
+    if (isDubbing) {
+      // === DUBBING MODE: Send audio to AI33PRO /v1/task/dubbing ===
+      // AI33PRO dubbing accepts audio file (max 20MB / 5min), dubs it with voice cloning
+      
+      // Extract audio as mp3 for dubbing
+      updateJob(jobId, "generating_voice", 68, "Extracting audio for dubbing...");
+      const rawAudioPath = `${workDir}/dub_input.mp3`;
+      await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${rawAudioPath}"`);
+      
+      const audioDuration = await getMediaDuration(rawAudioPath);
+      const audioSize = fs.statSync(rawAudioPath).size;
+      const MAX_DUB_DURATION = 270; // 4.5 min safety margin
+      const MAX_DUB_SIZE = 18 * 1024 * 1024; // 18MB safety margin
+      
+      console.log(`  📊 Dubbing input: ${audioDuration.toFixed(1)}s, ${(audioSize / 1024 / 1024).toFixed(1)} MB`);
+      
+      // Determine if we need to chunk
+      const needsChunking = audioDuration > MAX_DUB_DURATION || audioSize > MAX_DUB_SIZE;
+      const numChunks = needsChunking
+        ? Math.max(Math.ceil(audioDuration / MAX_DUB_DURATION), Math.ceil(audioSize / MAX_DUB_SIZE))
+        : 1;
+      const chunkDuration = Math.floor(audioDuration / numChunks);
+      
+      if (needsChunking) {
+        console.log(`  ✂️ Audio too large for dubbing, splitting into ${numChunks} chunks (~${chunkDuration}s each)...`);
+      }
+      
+      const dubbedChunkPaths = [];
+      const dubbedSrtSegments = [];
+      let srtTimeOffset = 0;
+      
+      for (let ci = 0; ci < numChunks; ci++) {
+        const chunkLabel = `${ci + 1}/${numChunks}`;
+        const pctBase = 70 + Math.floor((ci / numChunks) * 18);
+        updateJob(jobId, "generating_voice", pctBase, `Dubbing chunk ${chunkLabel}...`);
+        
+        let chunkPath = rawAudioPath;
+        if (needsChunking) {
+          chunkPath = `${workDir}/dub_chunk_${ci}.mp3`;
+          const startSec = ci * chunkDuration;
+          if (ci === numChunks - 1) {
+            await run(`ffmpeg -y -i "${rawAudioPath}" -ss ${startSec} -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${chunkPath}"`);
+          } else {
+            await run(`ffmpeg -y -i "${rawAudioPath}" -ss ${startSec} -t ${chunkDuration} -acodec libmp3lame -ar 44100 -ac 1 -b:a 128k "${chunkPath}"`);
+          }
+        }
+        
+        // Upload chunk to AI33PRO dubbing
+        const { Blob: BlobClass } = require("buffer");
+        const chunkBuffer = fs.readFileSync(chunkPath);
+        const chunkBlob = new BlobClass([chunkBuffer], { type: "audio/mp3" });
+        
+        const dubFormData = new globalThis.FormData();
+        dubFormData.append("file", chunkBlob, "audio.mp3");
+        dubFormData.append("num_speakers", "0");
+        dubFormData.append("disable_voice_cloning", "false");
+        dubFormData.append("source_lang", sourceLang === "auto" ? "auto" : sourceLang);
+        dubFormData.append("target_lang", targetLang);
+        
+        const dubResp = await ai33proRequest("/v1/task/dubbing", {
+          method: "POST",
+          headers: {},
+          body: dubFormData,
+        });
+        
+        if (!dubResp.ok) {
+          const errText = await dubResp.text();
+          throw new Error(`AI33PRO dubbing error ${dubResp.status}: ${errText}`);
+        }
+        
+        const dubResult = await dubResp.json();
+        if (!dubResult.success || !dubResult.task_id) {
+          throw new Error(`AI33PRO dubbing rejected: ${JSON.stringify(dubResult)}`);
+        }
+        
+        if (dubResult.ec_remain_credits !== undefined && dubResult.ec_remain_credits <= 0) {
+          throw new Error("AI33PRO out of credits");
+        }
+        
+        console.log(`  🎤 Dubbing chunk ${chunkLabel} submitted (task: ${dubResult.task_id})`);
+        
+        // Poll for result
+        const taskResult = await pollAI33ProTask(dubResult.task_id, 7200000, (elapsed) => {
+          const secs = Math.round(elapsed / 1000);
+          updateJob(jobId, "generating_voice", Math.min(pctBase + 15, 88), `Dubbing chunk ${chunkLabel} (${secs}s)...`);
+        });
+        
+        // Download dubbed audio
+        if (!taskResult.metadata?.audio_url) {
+          throw new Error(`AI33PRO dubbing chunk ${chunkLabel}: no audio in result`);
+        }
+        
+        const dubbedPath = `${workDir}/dubbed_${ci}.mp3`;
+        const audioResp = await fetch(taskResult.metadata.audio_url);
+        const audioArrayBuf = await audioResp.arrayBuffer();
+        fs.writeFileSync(dubbedPath, Buffer.from(audioArrayBuf));
+        dubbedChunkPaths.push(dubbedPath);
+        console.log(`  ✅ Dubbing chunk ${chunkLabel} done`);
+        
+        // Download SRT if available (for subtitles)
+        if (enableSubtitles && taskResult.metadata?.srt_url) {
+          try {
+            const srtResp = await fetch(taskResult.metadata.srt_url);
+            const srtText = await srtResp.text();
+            const chunkSegments = parseSrtToSegments(srtText);
+            // Offset timestamps for chunked audio
+            for (const seg of chunkSegments) {
+              dubbedSrtSegments.push({
+                start: seg.start + srtTimeOffset,
+                end: seg.end + srtTimeOffset,
+                text: seg.text,
+              });
+            }
+          } catch (_e) {
+            console.log(`  ⚠️ Could not download SRT for chunk ${chunkLabel}`);
+          }
+        }
+        
+        // Track time offset for next chunk's SRT
+        const chunkDubbedDuration = await getMediaDuration(dubbedPath);
+        srtTimeOffset += chunkDubbedDuration;
+        
+        // Cleanup chunk input
+        if (needsChunking) {
+          try { fs.unlinkSync(chunkPath); } catch (_) {}
+        }
+      }
+      
+      // Merge dubbed audio chunks
+      if (dubbedChunkPaths.length === 1) {
+        fs.copyFileSync(dubbedChunkPaths[0], `${workDir}/tts_audio.mp3`);
+      } else {
+        updateJob(jobId, "generating_voice", 89, "Merging dubbed audio chunks...");
+        const listFile = `${workDir}/dub_list.txt`;
+        fs.writeFileSync(listFile, dubbedChunkPaths.map((f) => `file '${f}'`).join("\n"));
+        await run(`ffmpeg -y -f concat -safe 0 -i "${listFile}" -c copy "${workDir}/tts_audio.mp3"`);
+        try { fs.unlinkSync(listFile); } catch (_) {}
+      }
+      
+      // Cleanup dubbed chunk files
+      dubbedChunkPaths.forEach((f) => { try { fs.unlinkSync(f); } catch (_) {} });
+      try { fs.unlinkSync(rawAudioPath); } catch (_) {}
+      
+      console.log(`  ✅ AI33PRO dubbing complete (${numChunks} chunks)`);
+      
+      // Write SRT from dubbing result if subtitles enabled
+      if (enableSubtitles && dubbedSrtSegments.length > 0) {
+        srtPath = `${workDir}/subtitles.srt`;
+        let srtContent = "";
+        for (let i = 0; i < dubbedSrtSegments.length; i++) {
+          const seg = dubbedSrtSegments[i];
+          srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+        }
+        fs.writeFileSync(srtPath, srtContent, "utf-8");
+        console.log(`  📄 Dubbing SRT: ${dubbedSrtSegments.length} segments`);
+      }
+    } else if (enableSubtitles && srtPath && transcript.segments && transcript.segments.length > 0) {
       // === Per-segment TTS: generate audio for each subtitle segment individually ===
       updateJob(jobId, "generating_voice", 70, "Generating voice per segment...");
       const translatedSegments = parseSrtToSegments(fs.readFileSync(srtPath, "utf-8"));
