@@ -992,9 +992,15 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
 
     var transcript = null;
 
-    // In dubbing mode, AI33PRO handles STT + translation + voice internally
-    // We only need transcript for translate mode
-    if (mode !== "dubbing") {
+    // Determine dubbing service early
+    const isDubbing = mode === "dubbing";
+    const dubbingServiceForJob = JOBS[jobId]?.dubbingService || "ai33pro";
+
+    // In dubbing mode, AI33PRO handles STT internally, but AI84PRO does NOT provide subtitles.
+    // So if dubbing with AI84PRO + subtitles enabled, we still need to run STT + translate for SRT.
+    const needTranscript = !isDubbing || (isDubbing && enableSubtitles && dubbingServiceForJob === "ai84pro");
+
+    if (needTranscript) {
       if (isYouTube) {
         updateJob(jobId, "downloading", 5, "Checking YouTube subtitles...");
         const ytSubs = await tryYouTubeSubtitles(workDir, url, sourceLang);
@@ -1015,14 +1021,32 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     }
 
     // ── TTS Generation ──
-    const isDubbing = mode === "dubbing";
     let translatedText;
     let srtPath = null;
 
     if (isDubbing) {
-      // Dubbing mode: AI33PRO handles translation + voice cloning internally
-      // Skip separate translate + TTS steps
-      updateJob(jobId, "translating", 55, "Dubbing mode — AI33PRO handles translation & voice...");
+      // Dubbing mode: generate subtitles separately if AI84PRO + subtitles enabled
+      if (enableSubtitles && dubbingServiceForJob === "ai84pro" && transcript && transcript.segments && transcript.segments.length > 0) {
+        updateJob(jobId, "translating", 52, "Translating segments for subtitles (AI84PRO)...");
+        const translatedSegments = [];
+        for (let i = 0; i < transcript.segments.length; i++) {
+          const seg = transcript.segments[i];
+          const translated = await translateText(seg.text, sourceLang, targetLang);
+          translatedSegments.push({ ...seg, text: translated });
+          if (i % 5 === 0) {
+            updateJob(jobId, "translating", 52 + Math.floor((i / transcript.segments.length) * 10), `Translating segment ${i + 1}/${transcript.segments.length}...`);
+          }
+        }
+        srtPath = `${workDir}/subtitles.srt`;
+        let srtContent = "";
+        for (let i = 0; i < translatedSegments.length; i++) {
+          const seg = translatedSegments[i];
+          srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+        }
+        fs.writeFileSync(srtPath, srtContent, "utf-8");
+        console.log(`  📄 Generated SRT for AI84PRO dubbing: ${translatedSegments.length} segments`);
+      }
+      updateJob(jobId, "translating", 55, "Dubbing mode — processing voice...");
     } else {
       // Translate mode: manual translate + Google TTS
       updateJob(jobId, "translating", 50);
