@@ -57,16 +57,17 @@ function sanitizeDubbingLang(value, { fallback = "en", allowDetect = false } = {
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.post("/api/process", auth, (req, res) => {
-  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate", dubbingConcurrency = 1, dubbingService = "ai33pro" } = req.body;
+  const { youtubeUrl, targetLang = "en", sourceLang = "auto", callbackUrl, enableSubtitles = false, voiceId = null, mode = "translate", dubbingConcurrency = 1, dubbingService = "ai33pro", sttConcurrency = 1 } = req.body;
   if (!youtubeUrl) return res.status(400).json({ error: "youtubeUrl required" });
 
   const safeTargetLang = sanitizeDubbingLang(targetLang, { fallback: "en" });
   const safeSourceLang = sanitizeDubbingLang(sourceLang, { fallback: "detect", allowDetect: true });
   const safeConcurrency = Math.max(1, Math.min(10, Number(dubbingConcurrency) || 1));
   const safeDubbingService = ["ai33pro", "ai84pro"].includes(dubbingService) ? dubbingService : "ai33pro";
+  const safeSttConcurrency = Math.max(1, Math.min(5, Number(sttConcurrency) || 1));
 
   const jobId = uuidv4();
-  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode, dubbingConcurrency: safeConcurrency, dubbingService: safeDubbingService };
+  JOBS[jobId] = { status: "queued", progress: 0, createdAt: new Date().toISOString(), youtubeUrl, sourceLang: safeSourceLang, targetLang: safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode, dubbingConcurrency: safeConcurrency, dubbingService: safeDubbingService, sttConcurrency: safeSttConcurrency };
   res.json({ jobId, status: "accepted" });
 
   processVideo(jobId, youtubeUrl, safeSourceLang, safeTargetLang, callbackUrl, enableSubtitles, voiceId, mode);
@@ -376,7 +377,7 @@ async function transcribeAudioChunk(filePath, jobId = null, chunkLabel = "") {
   throw new Error("AI33PRO STT: no transcript in result");
 }
 
-async function transcribeAudio(filePath, jobId = null) {
+async function transcribeAudio(filePath, jobId = null, sttConcurrency = 1) {
   if (!AI33PRO_API_KEY) {
     throw new Error("AI33PRO_API_KEY is not configured");
   }
@@ -427,27 +428,46 @@ async function transcribeAudio(filePath, jobId = null) {
     chunkFiles.push(chunkPath);
   }
 
-  // Transcribe each chunk sequentially (to preserve order and manage credits)
+  // Transcribe chunks with configurable concurrency
+  const concurrency = Math.max(1, Math.min(5, sttConcurrency));
+  console.log(`  🚀 Transcribing ${chunkFiles.length} STT chunks (concurrency: ${Math.min(concurrency, chunkFiles.length)})...`);
+  const chunkResults = new Array(chunkFiles.length);
+
+  for (let batchStart = 0; batchStart < chunkFiles.length; batchStart += concurrency) {
+    const batchEnd = Math.min(batchStart + concurrency, chunkFiles.length);
+    if (jobId) {
+      const pct = 35 + Math.floor((batchStart / chunkFiles.length) * 13);
+      updateJob(jobId, "transcribing", pct, `Transcribing chunks ${batchStart + 1}-${batchEnd}/${chunkFiles.length}...`);
+    }
+
+    const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
+    const results = await Promise.allSettled(
+      batchIndices.map(i => transcribeAudioChunk(chunkFiles[i], null, `${i + 1}/${chunkFiles.length}`))
+    );
+
+    for (let k = 0; k < results.length; k++) {
+      const idx = batchIndices[k];
+      if (results[k].status === "fulfilled") {
+        chunkResults[idx] = results[k].value;
+      } else {
+        throw new Error(`STT chunk ${idx + 1} failed: ${results[k].reason}`);
+      }
+      // Cleanup chunk file
+      try { fs.unlinkSync(chunkFiles[idx]); } catch (_) {}
+    }
+  }
+
+  // Merge results in order
   const allSegments = [];
   let fullText = "";
   let detectedLang = "auto";
-  let timeOffset = 0;
 
-  for (let i = 0; i < chunkFiles.length; i++) {
-    if (jobId) {
-      const pct = 35 + Math.floor((i / chunkFiles.length) * 13);
-      updateJob(jobId, "transcribing", pct, `Transcribing chunk ${i + 1}/${chunkFiles.length}...`);
-    }
-
-    const chunkResult = await transcribeAudioChunk(chunkFiles[i], null, `${i + 1}/${chunkFiles.length}`);
-
+  for (let i = 0; i < chunkResults.length; i++) {
+    const chunkResult = chunkResults[i];
     if (chunkResult.language && chunkResult.language !== "auto") {
       detectedLang = chunkResult.language;
     }
-
     fullText += (fullText ? " " : "") + chunkResult.text;
-
-    // Offset segment timestamps by the chunk's start time
     const chunkStartTime = i * chunkDuration;
     if (chunkResult.segments) {
       for (const seg of chunkResult.segments) {
@@ -458,9 +478,6 @@ async function transcribeAudio(filePath, jobId = null) {
         });
       }
     }
-
-    // Cleanup chunk file
-    try { fs.unlinkSync(chunkFiles[i]); } catch (_) {}
   }
 
   console.log(`  ✅ AI33PRO STT success (${chunkFiles.length} chunks merged, ${allSegments.length} segments)`);
@@ -1015,7 +1032,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         updateJob(jobId, "extracting_audio", 20);
         await run(`ffmpeg -y -i "${workDir}/video.mp4" -vn -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/audio.wav"`);
         updateJob(jobId, "transcribing", 30, "Uploading audio to STT service...");
-        transcript = await transcribeAudio(`${workDir}/audio.wav`, jobId);
+        const jobSttConcurrency = (JOBS[jobId] && JOBS[jobId].sttConcurrency) || 1;
+        transcript = await transcribeAudio(`${workDir}/audio.wav`, jobId, jobSttConcurrency);
       }
       fs.writeFileSync(`${workDir}/transcript.json`, JSON.stringify(transcript, null, 2));
     }
