@@ -1016,9 +1016,9 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     const isDubbing = mode === "dubbing";
     const dubbingServiceForJob = JOBS[jobId]?.dubbingService || "ai33pro";
 
-    // In dubbing mode, AI33PRO handles STT internally, but AI84PRO does NOT provide subtitles.
-    // So if dubbing with AI84PRO + subtitles enabled, we still need to run STT + translate for SRT.
-    const needTranscript = !isDubbing || (isDubbing && enableSubtitles && dubbingServiceForJob === "ai84pro");
+    // In dubbing mode, both AI33PRO and AI84PRO handle translation internally.
+    // Subtitles are generated AFTER dubbing (from API response or STT on dubbed audio).
+    const needTranscript = !isDubbing;
 
     if (needTranscript) {
       if (isYouTube) {
@@ -1046,27 +1046,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     let srtPath = null;
 
     if (isDubbing) {
-      // Dubbing mode: generate subtitles separately if AI84PRO + subtitles enabled
-      if (enableSubtitles && dubbingServiceForJob === "ai84pro" && transcript && transcript.segments && transcript.segments.length > 0) {
-        updateJob(jobId, "translating", 52, "Translating segments for subtitles (AI84PRO)...");
-        const translatedSegments = [];
-        for (let i = 0; i < transcript.segments.length; i++) {
-          const seg = transcript.segments[i];
-          const translated = await translateText(seg.text, sourceLang, targetLang);
-          translatedSegments.push({ ...seg, text: translated });
-          if (i % 5 === 0) {
-            updateJob(jobId, "translating", 52 + Math.floor((i / transcript.segments.length) * 10), `Translating segment ${i + 1}/${transcript.segments.length}...`);
-          }
-        }
-        srtPath = `${workDir}/subtitles.srt`;
-        let srtContent = "";
-        for (let i = 0; i < translatedSegments.length; i++) {
-          const seg = translatedSegments[i];
-          srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
-        }
-        fs.writeFileSync(srtPath, srtContent, "utf-8");
-        console.log(`  📄 Generated SRT for AI84PRO dubbing: ${translatedSegments.length} segments`);
-      }
+      // Dubbing mode: skip STT/Translate — both AI33PRO and AI84PRO handle it internally
       updateJob(jobId, "translating", 55, "Dubbing mode — processing voice...");
     } else {
       // Translate mode: manual translate + Google TTS
@@ -1327,7 +1307,7 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       
       console.log(`  ✅ AI33PRO dubbing complete (${numChunks} chunks)`);
       
-      // Write SRT from dubbing result if subtitles enabled
+      // Write SRT from dubbing result if subtitles enabled (AI33PRO returns SRT)
       if (enableSubtitles && dubbedSrtSegments.length > 0) {
         srtPath = `${workDir}/subtitles.srt`;
         let srtContent = "";
@@ -1337,6 +1317,31 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
         }
         fs.writeFileSync(srtPath, srtContent, "utf-8");
         console.log(`  📄 Dubbing SRT: ${dubbedSrtSegments.length} segments`);
+      }
+      
+      // If subtitles enabled but no SRT from API (e.g. AI84PRO), generate by running STT on dubbed audio
+      if (enableSubtitles && !srtPath && fs.existsSync(`${workDir}/tts_audio.mp3`)) {
+        console.log(`  📄 No SRT from dubbing API, running STT on dubbed audio for subtitles...`);
+        updateJob(jobId, "generating_voice", 89, "Generating subtitles from dubbed audio...");
+        try {
+          await run(`ffmpeg -y -i "${workDir}/tts_audio.mp3" -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/dubbed_audio.wav"`);
+          const dubbedTranscript = await transcribeAudio(`${workDir}/dubbed_audio.wav`, jobId, 1);
+          if (dubbedTranscript && dubbedTranscript.segments && dubbedTranscript.segments.length > 0) {
+            srtPath = `${workDir}/subtitles.srt`;
+            let srtContent = "";
+            for (let i = 0; i < dubbedTranscript.segments.length; i++) {
+              const seg = dubbedTranscript.segments[i];
+              srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+            }
+            fs.writeFileSync(srtPath, srtContent, "utf-8");
+            console.log(`  📄 Generated SRT from dubbed audio: ${dubbedTranscript.segments.length} segments`);
+          } else {
+            console.log(`  ⚠️ STT on dubbed audio returned no segments, skipping subtitles`);
+          }
+          try { fs.unlinkSync(`${workDir}/dubbed_audio.wav`); } catch (_) {}
+        } catch (sttErr) {
+          console.error(`  ⚠️ Failed to generate subtitles from dubbed audio: ${sttErr.message}`);
+        }
       }
     } else if (enableSubtitles && srtPath && transcript.segments && transcript.segments.length > 0) {
       // === Per-segment TTS: generate audio for each subtitle segment individually ===
@@ -1448,11 +1453,21 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
     const outputFile = `${jobId}.mp4`;
     fs.copyFileSync(`${workDir}/output.mp4`, path.join(__dirname, "output", outputFile));
 
+    // Copy SRT and audio to output directory for download
+    if (srtPath && fs.existsSync(srtPath)) {
+      fs.copyFileSync(srtPath, path.join(__dirname, "output", `${jobId}.srt`));
+    }
+    if (fs.existsSync(`${workDir}/tts_audio.mp3`)) {
+      fs.copyFileSync(`${workDir}/tts_audio.mp3`, path.join(__dirname, "output", `${jobId}.mp3`));
+    }
+
     JOBS[jobId] = {
       ...JOBS[jobId],
       status: "done",
       progress: 100,
       outputUrl: `/output/${outputFile}`,
+      srtUrl: srtPath && fs.existsSync(srtPath) ? `/output/${jobId}.srt` : null,
+      audioUrl: fs.existsSync(`${workDir}/tts_audio.mp3`) ? `/output/${jobId}.mp3` : null,
       completedAt: new Date().toISOString(),
     };
 
