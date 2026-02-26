@@ -111,6 +111,41 @@ app.get("/api/jobs", auth, (_req, res) => {
 app.use("/output", express.static(path.join(__dirname, "output")));
 app.use("/uploads", express.static(uploadDir));
 
+// Backfill: copy SRT/Audio from jobs/ to output/ for all completed jobs that are missing them
+app.post("/api/backfill-assets", auth, (req, res) => {
+  const jobsDir = path.join(__dirname, "jobs");
+  const outputDir = path.join(__dirname, "output");
+  if (!fs.existsSync(jobsDir)) return res.json({ copied: 0 });
+
+  let copied = 0;
+  const dirs = fs.readdirSync(jobsDir);
+  for (const jobId of dirs) {
+    const workDir = path.join(jobsDir, jobId);
+    if (!fs.statSync(workDir).isDirectory()) continue;
+
+    // Only process jobs that have a completed output
+    if (!fs.existsSync(path.join(outputDir, `${jobId}.mp4`))) continue;
+
+    const srtSrc = path.join(workDir, "subtitles.srt");
+    const srtDst = path.join(outputDir, `${jobId}.srt`);
+    if (fs.existsSync(srtSrc) && !fs.existsSync(srtDst)) {
+      fs.copyFileSync(srtSrc, srtDst);
+      copied++;
+      console.log(`[backfill] Copied SRT for ${jobId}`);
+    }
+
+    const audioSrc = path.join(workDir, "tts_audio.mp3");
+    const audioDst = path.join(outputDir, `${jobId}.mp3`);
+    if (fs.existsSync(audioSrc) && !fs.existsSync(audioDst)) {
+      fs.copyFileSync(audioSrc, audioDst);
+      copied++;
+      console.log(`[backfill] Copied Audio for ${jobId}`);
+    }
+  }
+
+  res.json({ copied, message: `Backfilled ${copied} files` });
+});
+
 // Re-burn subtitles on an existing completed job with updated style
 app.post("/api/reburn/:jobId", auth, async (req, res) => {
   const { jobId } = req.params;
