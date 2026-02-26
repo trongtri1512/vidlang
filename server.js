@@ -779,7 +779,7 @@ async function translateText(text, sourceLang, targetLang) {
           target: targetLang,
           format: "text",
         };
-        if (sourceLang && sourceLang !== "auto") {
+        if (sourceLang && sourceLang !== "auto" && sourceLang !== "detect" && /^[a-z]{2}(-[a-z]{2})?$/i.test(sourceLang)) {
           body.source = sourceLang;
         }
 
