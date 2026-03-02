@@ -1600,19 +1600,19 @@ function getVideoResolution(filePath) {
 function calcSubtitleStyle(height, width) {
   const isPortrait = height > width;
   const refDimension = isPortrait ? width : height;
-  // Portrait: much smaller font (10px base at 1080w) to avoid overwhelming narrow screen
-  // Landscape: 22px base at 1080p height
+  // Portrait: smaller font, spread wide so text fits in ~2 lines max
   const baseFontSize = isPortrait ? 10 : 22;
   const maxFont = isPortrait ? 14 : 28;
   const fontSize = Math.max(8, Math.min(maxFont, Math.round(refDimension * baseFontSize / 1080)));
   const outline = isPortrait
-    ? Math.max(1, Math.round(refDimension * 1.5 / 1080))  // Much thinner outline for portrait
+    ? Math.max(1, Math.round(refDimension * 1.5 / 1080))
     : Math.max(1, Math.round(refDimension * 4 / 1080));
   const marginV = isPortrait
-    ? Math.max(15, Math.round(height * 40 / 1920))  // Position near bottom for portrait
+    ? Math.max(15, Math.round(height * 40 / 1920))
     : Math.max(8, Math.round(height * 25 / 1080));
+  // Portrait: minimal horizontal margin so text spreads wide (2 lines instead of 5)
   const marginH = isPortrait
-    ? Math.max(20, Math.round(width * 60 / 1080))  // Wide horizontal margin for narrow screens
+    ? Math.max(5, Math.round(width * 10 / 1080))
     : Math.max(10, Math.round(height * 30 / 1080));
   return `FontName=Noto Sans CJK SC,FontSize=${fontSize},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H000080FF,BackColour=&H80000000,BorderStyle=3,Outline=${outline},Shadow=0,MarginV=${marginV},MarginL=${marginH},MarginR=${marginH},Alignment=2`;
 }
