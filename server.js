@@ -1343,14 +1343,24 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       console.log(`  ✅ AI33PRO dubbing complete (${numChunks} chunks)`);
       
       // Write SRT from dubbing result if subtitles enabled (AI33PRO returns SRT)
-      // BUT: always prefer STT on final dubbed audio for accurate sync
-      if (enableSubtitles && fs.existsSync(`${workDir}/tts_audio.mp3`)) {
-        console.log(`  📄 Running STT on dubbed audio for accurate subtitle sync...`);
-        updateJob(jobId, "generating_voice", 89, "Generating synced subtitles from dubbed audio...");
+      if (enableSubtitles && dubbedSrtSegments.length > 0) {
+        srtPath = `${workDir}/subtitles.srt`;
+        let srtContent = "";
+        for (let i = 0; i < dubbedSrtSegments.length; i++) {
+          const seg = dubbedSrtSegments[i];
+          srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
+        }
+        fs.writeFileSync(srtPath, srtContent, "utf-8");
+        console.log(`  📄 Dubbing SRT: ${dubbedSrtSegments.length} segments`);
+      }
+      
+      // If subtitles enabled but no SRT from API (e.g. AI84PRO), generate by running STT on dubbed audio
+      if (enableSubtitles && !srtPath && fs.existsSync(`${workDir}/tts_audio.mp3`)) {
+        console.log(`  📄 No SRT from dubbing API, running STT on dubbed audio for subtitles...`);
+        updateJob(jobId, "generating_voice", 89, "Generating subtitles from dubbed audio...");
         try {
           await run(`ffmpeg -y -i "${workDir}/tts_audio.mp3" -acodec pcm_s16le -ar 16000 -ac 1 "${workDir}/dubbed_audio.wav"`);
-          const sttConcurrencyVal = Math.max(1, Math.min(5, JOBS[jobId]?.sttConcurrency || 1));
-          const dubbedTranscript = await transcribeAudio(`${workDir}/dubbed_audio.wav`, jobId, sttConcurrencyVal);
+          const dubbedTranscript = await transcribeAudio(`${workDir}/dubbed_audio.wav`, jobId, 1);
           if (dubbedTranscript && dubbedTranscript.segments && dubbedTranscript.segments.length > 0) {
             srtPath = `${workDir}/subtitles.srt`;
             let srtContent = "";
@@ -1359,32 +1369,13 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
               srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
             }
             fs.writeFileSync(srtPath, srtContent, "utf-8");
-            console.log(`  📄 STT-synced SRT: ${dubbedTranscript.segments.length} segments`);
-          } else if (dubbedSrtSegments.length > 0) {
-            // Fallback to API SRT if STT fails
-            srtPath = `${workDir}/subtitles.srt`;
-            let srtContent = "";
-            for (let i = 0; i < dubbedSrtSegments.length; i++) {
-              const seg = dubbedSrtSegments[i];
-              srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
-            }
-            fs.writeFileSync(srtPath, srtContent, "utf-8");
-            console.log(`  📄 Fallback to API SRT: ${dubbedSrtSegments.length} segments`);
+            console.log(`  📄 Generated SRT from dubbed audio: ${dubbedTranscript.segments.length} segments`);
+          } else {
+            console.log(`  ⚠️ STT on dubbed audio returned no segments, skipping subtitles`);
           }
           try { fs.unlinkSync(`${workDir}/dubbed_audio.wav`); } catch (_) {}
         } catch (sttErr) {
-          console.error(`  ⚠️ STT on dubbed audio failed: ${sttErr.message}`);
-          // Fallback to API SRT
-          if (dubbedSrtSegments.length > 0) {
-            srtPath = `${workDir}/subtitles.srt`;
-            let srtContent = "";
-            for (let i = 0; i < dubbedSrtSegments.length; i++) {
-              const seg = dubbedSrtSegments[i];
-              srtContent += `${i + 1}\n${secondsToSrtTime(seg.start)} --> ${secondsToSrtTime(seg.end)}\n${seg.text}\n\n`;
-            }
-            fs.writeFileSync(srtPath, srtContent, "utf-8");
-            console.log(`  📄 Fallback to API SRT: ${dubbedSrtSegments.length} segments`);
-          }
+          console.error(`  ⚠️ Failed to generate subtitles from dubbed audio: ${sttErr.message}`);
         }
       }
     } else if (enableSubtitles && srtPath && transcript.segments && transcript.segments.length > 0) {
@@ -1608,20 +1599,21 @@ function getVideoResolution(filePath) {
 
 function calcSubtitleStyle(height, width) {
   const isPortrait = height > width;
-  // Font size tỷ lệ với chiều rộng
-  // Portrait: ~3.5% width (cap 16), Landscape: ~2.8% width (cap 28)
-  const fontRatio = isPortrait ? 0.035 : 0.028;
-  const fontSize = Math.max(8, Math.min(isPortrait ? 16 : 28, Math.round(width * fontRatio)));
+  const refDimension = isPortrait ? width : height;
+  // Portrait: much smaller font (10px base at 1080w) to avoid overwhelming narrow screen
+  // Landscape: 22px base at 1080p height
+  const baseFontSize = isPortrait ? 10 : 22;
+  const maxFont = isPortrait ? 14 : 28;
+  const fontSize = Math.max(8, Math.min(maxFont, Math.round(refDimension * baseFontSize / 1080)));
   const outline = isPortrait
-    ? Math.max(1, Math.round(fontSize * 0.15))
-    : Math.max(1, Math.round(fontSize * 0.18));
+    ? Math.max(1, Math.round(refDimension * 1.5 / 1080))  // Much thinner outline for portrait
+    : Math.max(1, Math.round(refDimension * 4 / 1080));
+  const marginV = isPortrait
+    ? Math.max(15, Math.round(height * 40 / 1920))  // Position near bottom for portrait
+    : Math.max(8, Math.round(height * 25 / 1080));
   const marginH = isPortrait
-    ? Math.max(20, Math.round(width * 0.06))
-    : Math.max(10, Math.round(width * 0.03));
-  // MarginV nhỏ gọn, Alignment=2 = bottom-center
-  // Dùng giá trị nhỏ (~2-3% height) để phụ đề nằm gần đáy video
-  const marginV = Math.max(10, Math.round(height * 0.03));
-  console.log(`  [SubStyle] ${width}x${height} ${isPortrait ? 'portrait' : 'landscape'} → font=${fontSize} outline=${outline} marginV=${marginV} marginH=${marginH}`);
+    ? Math.max(20, Math.round(width * 60 / 1080))  // Wide horizontal margin for narrow screens
+    : Math.max(10, Math.round(height * 30 / 1080));
   return `FontName=Noto Sans CJK SC,FontSize=${fontSize},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H000080FF,BackColour=&H80000000,BorderStyle=3,Outline=${outline},Shadow=0,MarginV=${marginV},MarginL=${marginH},MarginR=${marginH},Alignment=2`;
 }
 
