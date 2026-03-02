@@ -175,8 +175,8 @@ app.post("/api/reburn/:jobId", auth, async (req, res) => {
   try {
     const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
     const resolution = await getVideoResolution(videoPath);
-    const subStyle = calcSubtitleStyle(resolution.height);
-    console.log(`[${jobId}] Reburn subtitle style: ${subStyle} (video ${resolution.width}x${resolution.height})`);
+    const subStyle = calcSubtitleStyle(resolution.height, resolution.width);
+    console.log(`[${jobId}] Reburn subtitle style: ${subStyle} (video ${resolution.width}x${resolution.height}, ${resolution.height > resolution.width ? 'portrait' : 'landscape'})`);
     await run(`ffmpeg -y -i "${videoPath}" -i "${ttsAudioPath}" -vf "subtitles='${absSrtPath}':force_style='${subStyle}'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
 
     const outputFile = `${jobId}.mp4`;
@@ -1478,8 +1478,8 @@ async function processVideo(jobId, url, sourceLang, targetLang, callbackUrl, ena
       const absSrtPath = path.resolve(srtPath).replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "'\\''");
       // Auto-scale subtitle style based on video resolution
       const resolution = await getVideoResolution(`${workDir}/video.mp4`);
-      const subStyle = calcSubtitleStyle(resolution.height);
-      console.log(`[${jobId}] Subtitle style: ${subStyle} (video ${resolution.width}x${resolution.height})`);
+      const subStyle = calcSubtitleStyle(resolution.height, resolution.width);
+      console.log(`[${jobId}] Subtitle style: ${subStyle} (video ${resolution.width}x${resolution.height}, ${resolution.height > resolution.width ? 'portrait' : 'landscape'})`);
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -vf "subtitles='${absSrtPath}':force_style='${subStyle}'" -c:v libx264 -preset fast -crf 23 -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
     } else {
       await run(`ffmpeg -y -i "${workDir}/video.mp4" -i "${workDir}/tts_audio.mp3" -c:v copy -map 0:v:0 -map 1:a:0 -shortest "${workDir}/output.mp4"`);
@@ -1597,12 +1597,20 @@ function getVideoResolution(filePath) {
   });
 }
 
-function calcSubtitleStyle(height) {
-  // Scale font size based on video height (reference: 22 at 1080p)
-  const fontSize = Math.max(10, Math.min(28, Math.round(height * 22 / 1080)));
-  const outline = Math.max(1, Math.round(height * 4 / 1080));
-  const marginV = Math.max(8, Math.round(height * 25 / 1080));
-  const marginH = Math.max(10, Math.round(height * 30 / 1080));
+function calcSubtitleStyle(height, width) {
+  const isPortrait = height > width;
+  // MarginV = 1/8 chiều cao video → phụ đề nằm ở vị trí 1/8 từ đáy
+  const marginV = Math.max(10, Math.round(height / 8));
+  // Font size tỷ lệ với chiều rộng để phù hợp khung hình
+  // Portrait: ~3.5% width, Landscape: ~2.8% width (capped)
+  const fontRatio = isPortrait ? 0.035 : 0.028;
+  const fontSize = Math.max(8, Math.min(isPortrait ? 16 : 28, Math.round(width * fontRatio)));
+  const outline = isPortrait
+    ? Math.max(1, Math.round(fontSize * 0.15))
+    : Math.max(1, Math.round(fontSize * 0.18));
+  const marginH = isPortrait
+    ? Math.max(20, Math.round(width * 0.06))
+    : Math.max(10, Math.round(width * 0.03));
   return `FontName=Noto Sans CJK SC,FontSize=${fontSize},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H000080FF,BackColour=&H80000000,BorderStyle=3,Outline=${outline},Shadow=0,MarginV=${marginV},MarginL=${marginH},MarginR=${marginH},Alignment=2`;
 }
 
