@@ -361,7 +361,7 @@ async function pollAI33ProTask(taskId, maxWaitMs = 7200000, onProgress = null) {
 // ── STT: AI33PRO only ──
 
 // Transcribe a single audio chunk with AI33PRO (must be <20MB and <5min)
-async function transcribeAudioChunk(filePath, jobId = null, chunkLabel = "") {
+async function transcribeAudioChunk(filePath, jobId = null, chunkLabel = "", actualDuration = null) {
   const { Blob } = require("buffer");
   const fileBuffer = fs.readFileSync(filePath);
   const fileSizeMB = (fileBuffer.length / (1024 * 1024)).toFixed(1);
@@ -402,7 +402,7 @@ async function transcribeAudioChunk(filePath, jobId = null, chunkLabel = "") {
     const fullText = jsonData.text || extractTextFromJson(jsonData);
     const segments = rawSegments && rawSegments.length > 0
       ? rawSegments
-      : generateSegmentsFromText(fullText);
+      : generateSegmentsFromText(fullText, actualDuration);
     return { text: fullText, language: jsonData.language || "auto", segments };
   }
 
@@ -435,7 +435,7 @@ async function transcribeAudio(filePath, jobId = null, sttConcurrency = 1) {
   // If audio is small enough, transcribe directly
   if (audioDuration <= MAX_DURATION && fileSize <= MAX_SIZE) {
     if (jobId) updateJob(jobId, "transcribing", 35, `Uploading audio (${fileSizeMB} MB)...`);
-    const result = await transcribeAudioChunk(filePath, jobId, "1/1");
+    const result = await transcribeAudioChunk(filePath, jobId, "1/1", audioDuration);
     console.log("  ✅ AI33PRO STT success");
     if (jobId) updateJob(jobId, "transcribing", 50, "Transcript ready!");
     return result;
@@ -480,7 +480,12 @@ async function transcribeAudio(filePath, jobId = null, sttConcurrency = 1) {
 
     const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, k) => batchStart + k);
     const results = await Promise.allSettled(
-      batchIndices.map(i => transcribeAudioChunk(chunkFiles[i], null, `${i + 1}/${chunkFiles.length}`))
+      batchIndices.map(i => {
+        const chunkActualDuration = (i === chunkFiles.length - 1)
+          ? audioDuration - i * chunkDuration
+          : chunkDuration;
+        return transcribeAudioChunk(chunkFiles[i], null, `${i + 1}/${chunkFiles.length}`, chunkActualDuration);
+      })
     );
 
     for (let k = 0; k < results.length; k++) {
@@ -537,7 +542,8 @@ function extractTextFromJson(data) {
 }
 // Generate pseudo-segments from plain text when STT doesn't provide timestamps
 // Splits by sentences first, then further splits long sentences into ~80 char chunks
-function generateSegmentsFromText(text) {
+// If actualDuration is provided, timestamps are scaled to fit the real audio duration
+function generateSegmentsFromText(text, actualDuration = null) {
   if (!text || text.trim().length === 0) return [];
   
   const MAX_CHARS = 80; // Max chars per subtitle line
@@ -597,7 +603,17 @@ function generateSegmentsFromText(text) {
     segments.push({ start: currentTime, end: currentTime + duration, text: chunk });
     currentTime += duration;
   }
-  console.log(`  📝 Generated ${segments.length} pseudo-segments from text (total: ${currentTime.toFixed(1)}s estimated)`);
+  // Scale timestamps to fit actual audio duration if provided
+  if (actualDuration && actualDuration > 0 && currentTime > 0) {
+    const scale = actualDuration / currentTime;
+    for (const seg of segments) {
+      seg.start = seg.start * scale;
+      seg.end = seg.end * scale;
+    }
+    console.log(`  📝 Generated ${segments.length} pseudo-segments, scaled from ${currentTime.toFixed(1)}s to ${actualDuration.toFixed(1)}s (actual audio duration)`);
+  } else {
+    console.log(`  📝 Generated ${segments.length} pseudo-segments from text (total: ${currentTime.toFixed(1)}s estimated)`);
+  }
   return segments;
 }
 
